@@ -25,24 +25,84 @@ const entityColors = {
   period: { bg: 'bg-amber-500/20', text: 'text-amber-400', border: 'border-amber-500' },
 }
 
-export default function ConversationalChat({ onEntityCreated, onEntitySelect, fullPage = false }) {
-  const [messages, setMessages] = useState([])
+const WELCOME_MESSAGE = {
+  id: 'welcome',
+  role: 'assistant',
+  content: "Hi! I'm your knowledge assistant. You can ask me questions about your data, add new information, or both at once. I'll propose any changes for your review before saving.",
+  timestamp: new Date().toISOString(),
+}
+
+export default function ConversationalChat({ 
+  conversationId: propConversationId,
+  onEntityCreated, 
+  onEntitySelect, 
+  onConversationUpdate,
+  fullPage = false 
+}) {
+  const [messages, setMessages] = useState([WELCOME_MESSAGE])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
-  const [conversationId, setConversationId] = useState(null)
+  const [conversationId, setConversationId] = useState(propConversationId || null)
   const [pendingProposal, setPendingProposal] = useState(null)
+  const [loadingHistory, setLoadingHistory] = useState(false)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
+  const hasLoadedHistory = useRef(false)
 
+  // Load conversation history when conversationId changes
   useEffect(() => {
-    // Initialize conversation
-    setMessages([{
-      id: 'welcome',
-      role: 'assistant',
-      content: "Hi! I'm your knowledge assistant. You can ask me questions about your data, add new information, or both at once. I'll propose any changes for your review before saving.",
-      timestamp: new Date().toISOString(),
-    }])
-  }, [])
+    if (propConversationId && propConversationId !== conversationId) {
+      setConversationId(propConversationId)
+      hasLoadedHistory.current = false
+    }
+  }, [propConversationId])
+
+  // Load messages from backend
+  useEffect(() => {
+    if (conversationId && !hasLoadedHistory.current) {
+      loadConversationHistory()
+    }
+  }, [conversationId])
+
+  const loadConversationHistory = async () => {
+    if (!conversationId || hasLoadedHistory.current) return
+    
+    setLoadingHistory(true)
+    try {
+      const res = await fetch(`${API_BASE}/conversations/${conversationId}?include_messages=true`)
+      if (res.ok) {
+        const data = await res.json()
+        hasLoadedHistory.current = true
+        
+        if (data.messages && data.messages.length > 0) {
+          // Convert backend messages to our format
+          const loadedMessages = data.messages.map(msg => ({
+            id: msg.id,
+            role: msg.role,
+            content: msg.content,
+            timestamp: msg.created_at,
+            // Parse entities if stored
+            entities_mentioned: msg.entities_mentioned,
+          }))
+          
+          // Add welcome message at the start if first message is from user
+          if (loadedMessages[0]?.role === 'user') {
+            setMessages([WELCOME_MESSAGE, ...loadedMessages])
+          } else {
+            setMessages(loadedMessages.length > 0 ? loadedMessages : [WELCOME_MESSAGE])
+          }
+        } else {
+          // No messages yet, show welcome
+          setMessages([WELCOME_MESSAGE])
+        }
+      }
+    } catch (e) {
+      console.error('Failed to load conversation history:', e)
+      setMessages([WELCOME_MESSAGE])
+    } finally {
+      setLoadingHistory(false)
+    }
+  }
 
   useEffect(() => {
     scrollToBottom()
@@ -52,11 +112,35 @@ export default function ConversationalChat({ onEntityCreated, onEntitySelect, fu
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
 
+  // Auto-name conversation based on first user message
+  const autoNameConversation = async (convId, firstMessage) => {
+    if (!convId || !firstMessage || !onConversationUpdate) return
+    
+    // Create a short name from the first message
+    let name = firstMessage.slice(0, 50)
+    if (firstMessage.length > 50) {
+      name = name.slice(0, name.lastIndexOf(' ')) + '...'
+    }
+    
+    try {
+      await fetch(`${API_BASE}/conversations/${convId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      
+      onConversationUpdate({ name, preview: firstMessage.slice(0, 100) })
+    } catch (e) {
+      console.error('Failed to auto-name conversation:', e)
+    }
+  }
+
   const handleSubmit = async (e) => {
     e.preventDefault()
     if (!input.trim() || isLoading) return
 
     const userMessage = input.trim()
+    const isFirstUserMessage = messages.filter(m => m.role === 'user').length === 0
     setInput('')
     
     // Add user message
@@ -84,7 +168,21 @@ export default function ConversationalChat({ onEntityCreated, onEntitySelect, fu
       
       // Update conversation ID
       if (data.conversation_id) {
-        setConversationId(data.conversation_id)
+        const newConvId = data.conversation_id
+        setConversationId(newConvId)
+        
+        // Auto-name if this was the first message
+        if (isFirstUserMessage) {
+          autoNameConversation(newConvId, userMessage)
+        }
+        
+        // Update message count
+        if (onConversationUpdate) {
+          onConversationUpdate({ 
+            updated_at: new Date().toISOString(),
+            message_count: messages.length + 1,
+          })
+        }
       }
       
       // Handle response based on type
@@ -226,36 +324,44 @@ export default function ConversationalChat({ onEntityCreated, onEntitySelect, fu
   if (fullPage) {
     return (
       <div className="h-full flex flex-col bg-midnight overflow-hidden">
-        {/* Full Page Header */}
-        <div className="flex-shrink-0 p-6 border-b border-neon-purple/20">
-          <div className="max-w-4xl mx-auto flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-neon-purple via-neon-blue to-neon-cyan flex items-center justify-center shadow-lg shadow-neon-purple/20">
-                <Sparkles className="w-6 h-6 text-white" />
+        {/* Full Page Header - Only shown when not in ChatManager */}
+        {!propConversationId && (
+          <div className="flex-shrink-0 p-6 border-b border-neon-purple/20">
+            <div className="max-w-4xl mx-auto flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-neon-purple via-neon-blue to-neon-cyan flex items-center justify-center shadow-lg shadow-neon-purple/20">
+                  <Sparkles className="w-6 h-6 text-white" />
+                </div>
+                <div>
+                  <h1 className="text-2xl font-display font-bold neon-text">Knowledge Assistant</h1>
+                  <p className="text-sm text-slate-400">Ask questions, add information, or manage your knowledge graph</p>
+                </div>
               </div>
-              <div>
-                <h1 className="text-2xl font-display font-bold neon-text">Knowledge Assistant</h1>
-                <p className="text-sm text-slate-400">Ask questions, add information, or manage your knowledge graph</p>
-              </div>
+              <button
+                onClick={() => {
+                  setMessages([WELCOME_MESSAGE])
+                  setConversationId(null)
+                  setPendingProposal(null)
+                  hasLoadedHistory.current = false
+                }}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-dark border border-slate-700 hover:border-neon-purple/50 transition-colors"
+              >
+                <RefreshCw className="w-4 h-4 text-slate-400" />
+                <span className="text-sm text-slate-400">New Chat</span>
+              </button>
             </div>
-            <button
-              onClick={() => {
-                setMessages([messages[0]])
-                setConversationId(null)
-                setPendingProposal(null)
-              }}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-dark border border-slate-700 hover:border-neon-purple/50 transition-colors"
-            >
-              <RefreshCw className="w-4 h-4 text-slate-400" />
-              <span className="text-sm text-slate-400">New Chat</span>
-            </button>
           </div>
-        </div>
+        )}
 
         {/* Messages Area - Centered */}
         <div className="flex-1 overflow-y-auto">
           <div className="max-w-4xl mx-auto p-6 space-y-6">
-            {messages.map((message) => (
+            {loadingHistory ? (
+              <div className="flex items-center justify-center py-12">
+                <Loader2 className="w-6 h-6 text-neon-purple animate-spin" />
+                <span className="ml-3 text-slate-400">Loading conversation...</span>
+              </div>
+            ) : messages.map((message) => (
               <MessageBubble key={message.id} message={message} fullPage onEntitySelect={onEntitySelect} />
             ))}
             
@@ -332,33 +438,41 @@ export default function ConversationalChat({ onEntityCreated, onEntitySelect, fu
   // Sidebar layout (original)
   return (
     <div className="flex flex-col h-full bg-obsidian">
-      {/* Header */}
-      <div className="p-4 border-b border-neon-purple/20 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-neon-purple to-neon-blue flex items-center justify-center">
-            <Sparkles className="w-4 h-4 text-white" />
+      {/* Header - Only show if not managed by ChatManager */}
+      {!propConversationId && (
+        <div className="p-4 border-b border-neon-purple/20 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-neon-purple to-neon-blue flex items-center justify-center">
+              <Sparkles className="w-4 h-4 text-white" />
+            </div>
+            <div>
+              <span className="font-semibold">Knowledge Assistant</span>
+              <p className="text-xs text-slate-500">Ask questions or add information</p>
+            </div>
           </div>
-          <div>
-            <span className="font-semibold">Knowledge Assistant</span>
-            <p className="text-xs text-slate-500">Ask questions or add information</p>
-          </div>
+          <button
+            onClick={() => {
+              setMessages([WELCOME_MESSAGE])
+              setConversationId(null)
+              setPendingProposal(null)
+              hasLoadedHistory.current = false
+            }}
+            className="p-2 rounded-lg hover:bg-slate-dark transition-colors"
+            title="New conversation"
+          >
+            <RefreshCw className="w-4 h-4 text-slate-400" />
+          </button>
         </div>
-        <button
-          onClick={() => {
-            setMessages([messages[0]])
-            setConversationId(null)
-            setPendingProposal(null)
-          }}
-          className="p-2 rounded-lg hover:bg-slate-dark transition-colors"
-          title="New conversation"
-        >
-          <RefreshCw className="w-4 h-4 text-slate-400" />
-        </button>
-      </div>
+      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {messages.map((message) => (
+        {loadingHistory ? (
+          <div className="flex items-center justify-center py-8">
+            <Loader2 className="w-5 h-5 text-neon-purple animate-spin" />
+            <span className="ml-2 text-sm text-slate-400">Loading...</span>
+          </div>
+        ) : messages.map((message) => (
           <MessageBubble key={message.id} message={message} onEntitySelect={onEntitySelect} />
         ))}
         

@@ -71,6 +71,16 @@ class EntityProposal:
     selected_candidate_id: str | None = None
     """User's selection (None = pending)."""
     
+    # Date fields for Period and Event entities
+    start_date: str | None = None
+    """Start date for periods (YYYY-MM-DD format)."""
+    
+    end_date: str | None = None
+    """End date for periods (YYYY-MM-DD format)."""
+    
+    on_date: str | None = None
+    """Specific date for events (YYYY-MM-DD format)."""
+    
     user_notes: str | None = None
     """Optional notes/description from user."""
 
@@ -206,6 +216,9 @@ class ProposalGenerator:
                 entity_type=entity_data.get("type", "person"),
                 context=entity_data.get("context"),
                 conversation_id=conversation_id,
+                start_date=entity_data.get("start_date"),
+                end_date=entity_data.get("end_date"),
+                on_date=entity_data.get("on_date"),
             )
             proposal_set.entity_proposals.append(entity_proposal)
         
@@ -302,6 +315,9 @@ class ProposalGenerator:
         entity_type: str,
         context: str | None,
         conversation_id: str | None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        on_date: str | None = None,
     ) -> EntityProposal:
         """Generate a proposal for a single entity mention."""
         
@@ -311,6 +327,9 @@ class ProposalGenerator:
             inferred_type=entity_type,
             inferred_context=context,
             candidates=[],
+            start_date=start_date,
+            end_date=end_date,
+            on_date=on_date,
         )
         
         # Find potential matches
@@ -501,6 +520,9 @@ def proposal_set_to_dict(proposal_set: ProposalSet) -> dict:
                 "inferred_type": p.inferred_type,
                 "inferred_context": p.inferred_context,
                 "selected_candidate_id": p.selected_candidate_id,
+                "start_date": p.start_date,
+                "end_date": p.end_date,
+                "on_date": p.on_date,
                 "candidates": [
                     {
                         "id": c.id,
@@ -669,10 +691,20 @@ def execute_approved_proposals(
                     graph_store.upsert_node(entity)
                     
                 elif proposal.inferred_type == "event":
+                    # Parse on_date if provided
+                    event_date = None
+                    if hasattr(proposal, 'on_date') and proposal.on_date:
+                        try:
+                            from datetime import date as date_type
+                            event_date = date_type.fromisoformat(proposal.on_date)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Could not parse on_date: {proposal.on_date}")
+                    
                     entity = Event(
                         id=uuid4(),
                         title=proposal.mention,
                         source=Source.USER,
+                        on_date=event_date,
                     )
                     filepath = md_store.write(entity)
                     registry.index(
@@ -686,10 +718,28 @@ def execute_approved_proposals(
                     graph_store.upsert_node(entity)
                     
                 elif proposal.inferred_type == "period":
+                    # Parse start_date and end_date if provided
+                    period_start = None
+                    period_end = None
+                    if hasattr(proposal, 'start_date') and proposal.start_date:
+                        try:
+                            from datetime import date as date_type
+                            period_start = date_type.fromisoformat(proposal.start_date)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Could not parse start_date: {proposal.start_date}")
+                    if hasattr(proposal, 'end_date') and proposal.end_date:
+                        try:
+                            from datetime import date as date_type
+                            period_end = date_type.fromisoformat(proposal.end_date)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Could not parse end_date: {proposal.end_date}")
+                    
                     entity = Period(
                         id=uuid4(),
                         name=proposal.mention,
                         source=Source.USER,
+                        start_date=period_start,
+                        end_date=period_end,
                     )
                     filepath = md_store.write(entity)
                     registry.index(

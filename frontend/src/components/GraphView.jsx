@@ -18,7 +18,7 @@ const nodeColors = {
   period: '#f97316',   // orange
 }
 
-export default function GraphView({ onNodeSelect }) {
+export default function GraphView({ onNodeSelect, refreshKey }) {
   const graphRef = useRef()
   const [graphData, setGraphData] = useState({ nodes: [], links: [] })
   const [loading, setLoading] = useState(true)
@@ -49,9 +49,10 @@ export default function GraphView({ onNodeSelect }) {
     return { nodes: visibleNodes, links: visibleLinks }
   }, [graphData, visibleTypes])
 
+  // Fetch graph data on mount and when refreshKey changes
   useEffect(() => {
     fetchGraphData()
-  }, [])
+  }, [refreshKey])
 
   // Configure force simulation for better node spacing
   useEffect(() => {
@@ -374,10 +375,11 @@ export default function GraphView({ onNodeSelect }) {
         </button>
         <button 
           onClick={fetchGraphData}
-          className="p-2 rounded-lg glass neon-border hover:border-neon-purple transition-colors"
+          disabled={loading}
+          className="p-2 rounded-lg glass neon-border hover:border-neon-purple transition-colors disabled:opacity-50"
           title="Refresh"
         >
-          <RefreshCw className="w-5 h-5 text-neon-purple" />
+          <RefreshCw className={`w-5 h-5 text-neon-purple ${loading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 

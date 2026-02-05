@@ -168,6 +168,11 @@ export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSel
               onRefresh?.()
             }}
             onCancel={() => setIsEditing(false)}
+            onDelete={() => {
+              // Close the sidebar and refresh the list
+              onClose?.()
+              onRefresh?.()
+            }}
           />
         ) : (
           <>

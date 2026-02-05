@@ -97,6 +97,10 @@ class ProposalConfirmRequest(BaseModel):
     document_approvals: dict[str, bool] = {}  # proposal_id -> approved
 
 
+class UpdateConversationRequest(BaseModel):
+    name: str | None = None
+
+
 class GraphData(BaseModel):
     nodes: list[dict]
     edges: list[dict]
@@ -507,6 +511,83 @@ async def update_entity(entity_id: str, updates: UpdateEntityRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/entities/{entity_id}")
+async def delete_entity(entity_id: str, hard_delete: bool = False):
+    """
+    Delete an entity.
+    
+    Args:
+        entity_id: The entity ID to delete
+        hard_delete: If True, permanently delete. If False (default), soft delete.
+    
+    Deletes:
+    - The entity's markdown file
+    - The entity from the registry (SQLite)
+    - The entity from the graph store (Neo4j)
+    - Associated documents (General Info, etc.)
+    """
+    try:
+        # Get existing entity
+        entity = registry.get(entity_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        
+        entity_type = entity.get("type")
+        entity_name = entity.get("name") or entity.get("title", "Unknown")
+        
+        # Get the markdown file path
+        md_doc = md_store.read_by_id(entity_id, entity_type)
+        filepath = md_doc.get("path") if md_doc else None
+        
+        # Delete associated documents (General Info, etc.)
+        docs = registry.list_entity_documents(entity_id)
+        for doc in docs:
+            try:
+                doc_md = md_store.read_document(doc["id"])
+                if doc_md and doc_md.get("path"):
+                    import os
+                    os.remove(doc_md["path"])
+                registry.delete(doc["id"])
+                logger.info(f"Deleted associated document {doc['id']}")
+            except Exception as doc_err:
+                logger.warning(f"Failed to delete document {doc.get('id')}: {doc_err}")
+        
+        # Delete from graph store
+        try:
+            graph_store.delete_node(entity_id)
+            logger.info(f"Deleted entity from graph: {entity_id}")
+        except Exception as graph_err:
+            logger.warning(f"Failed to delete from graph: {graph_err}")
+        
+        # Delete from registry
+        registry.delete(entity_id)
+        logger.info(f"Deleted entity from registry: {entity_id}")
+        
+        # Delete markdown file
+        if filepath:
+            import os
+            try:
+                os.remove(filepath)
+                logger.info(f"Deleted markdown file: {filepath}")
+            except Exception as file_err:
+                logger.warning(f"Failed to delete file {filepath}: {file_err}")
+        
+        logger.info(f"Deleted {entity_type}: {entity_name} ({entity_id})")
+        
+        return {
+            "success": True,
+            "message": f"Deleted {entity_type} '{entity_name}' successfully",
+            "entity_id": entity_id,
+            "entity_type": entity_type,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting entity: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==========================================
 # Period Endpoints
 # ==========================================
@@ -911,6 +992,92 @@ async def get_timeline(days: int = 7):
 
 
 # ==========================================
+# Conversation Management Endpoints
+# ==========================================
+
+@app.get("/conversations")
+async def list_conversations(limit: int = 50):
+    """List all conversations with preview."""
+    try:
+        conversations = conv_store.list_conversations_with_preview(limit=limit)
+        return {"conversations": conversations, "count": len(conversations)}
+    except Exception as e:
+        logger.error(f"Error listing conversations: {e}")
+        return {"conversations": [], "count": 0, "error": str(e)}
+
+
+@app.post("/conversations")
+async def create_new_conversation(name: str | None = None):
+    """Create a new conversation."""
+    try:
+        conv_id = conv_store.create_conversation(name=name)
+        return {
+            "success": True,
+            "conversation_id": conv_id,
+            "name": name or "New Chat",
+        }
+    except Exception as e:
+        logger.error(f"Error creating conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/conversations/{conv_id}")
+async def get_conversation_detail(conv_id: str, include_messages: bool = True):
+    """Get a conversation with its messages."""
+    try:
+        conv = conv_store.get_conversation_summary(conv_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        result = {
+            "conversation": conv,
+        }
+        
+        if include_messages:
+            messages = conv_store.get_messages(conv_id, limit=100)
+            result["messages"] = messages
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/conversations/{conv_id}")
+async def update_conversation(conv_id: str, request: UpdateConversationRequest):
+    """Update a conversation's name."""
+    try:
+        success = conv_store.update_conversation(conv_id, name=request.name)
+        if not success:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        return {"success": True, "message": "Conversation updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/conversations/{conv_id}")
+async def delete_conversation_endpoint(conv_id: str):
+    """Delete a conversation and all its messages."""
+    try:
+        success = conv_store.delete_conversation(conv_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        return {"success": True, "message": "Conversation deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
 # Conversational Interface (Proposal-based)
 # ==========================================
 
@@ -1020,10 +1187,21 @@ def _build_proposal_message(proposal_set) -> str:
         entity_summary = []
         for p in proposal_set.entity_proposals:
             existing_count = len([c for c in p.candidates if not c.is_create_new])
+            
+            # Build date info string
+            date_info = ""
+            if p.inferred_type == "period":
+                if p.start_date or p.end_date:
+                    start = p.start_date or "?"
+                    end = p.end_date or "ongoing"
+                    date_info = f" [From {start} to {end}]"
+            elif p.inferred_type == "event" and p.on_date:
+                date_info = f" [On {p.on_date}]"
+            
             if existing_count > 0:
-                entity_summary.append(f"**{p.mention}** ({p.inferred_type}) - found {existing_count} possible matches")
+                entity_summary.append(f"**{p.mention}** ({p.inferred_type}){date_info} - found {existing_count} possible matches")
             else:
-                entity_summary.append(f"**{p.mention}** ({p.inferred_type}) - will create new")
+                entity_summary.append(f"**{p.mention}** ({p.inferred_type}){date_info} - will create new")
         parts.append("Entities:\n" + "\n".join(f"• {s}" for s in entity_summary))
     
     if proposal_set.relationship_proposals:

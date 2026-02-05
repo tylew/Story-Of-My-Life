@@ -53,6 +53,7 @@ class ConversationStore:
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
                     user_id TEXT,
+                    name TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     metadata TEXT,
@@ -69,6 +70,11 @@ class ConversationStore:
             
             try:
                 conn.execute("ALTER TABLE conversations ADD COLUMN partial_extraction TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            
+            try:
+                conn.execute("ALTER TABLE conversations ADD COLUMN name TEXT")
             except sqlite3.OperationalError:
                 pass  # Column already exists
             
@@ -134,32 +140,85 @@ class ConversationStore:
         finally:
             conn.close()
     
-    def create_conversation(self, conversation_id: str | None = None, user_id: str | None = None) -> str:
+    def create_conversation(
+        self,
+        conversation_id: str | None = None,
+        user_id: str | None = None,
+        name: str | None = None,
+    ) -> str:
         """
         Create a new conversation.
         
         Args:
             conversation_id: Optional specific conversation ID (generates UUID if not provided)
             user_id: Optional user identifier
+            name: Optional conversation name (defaults to "New Chat")
         
         Returns:
             Conversation ID
         """
         conv_id = conversation_id or str(uuid4())
         now = datetime.now().isoformat()
+        conv_name = name or "New Chat"
         
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO conversations (id, user_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO conversations (id, user_id, name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (conv_id, user_id, now, now),
+                (conv_id, user_id, conv_name, now, now),
             )
             conn.commit()
         
         logger.debug(f"Created conversation: {conv_id}")
         return conv_id
+    
+    def update_conversation(
+        self,
+        conv_id: str,
+        name: str | None = None,
+        metadata: dict | None = None,
+    ) -> bool:
+        """
+        Update a conversation's name or metadata.
+        
+        Args:
+            conv_id: Conversation ID
+            name: New conversation name
+            metadata: New metadata dict
+        
+        Returns:
+            True if conversation was found and updated
+        """
+        now = datetime.now().isoformat()
+        
+        with self._get_connection() as conn:
+            updates = []
+            params = []
+            
+            if name is not None:
+                updates.append("name = ?")
+                params.append(name)
+            
+            if metadata is not None:
+                updates.append("metadata = ?")
+                params.append(json.dumps(metadata))
+            
+            if not updates:
+                return False
+            
+            updates.append("updated_at = ?")
+            params.append(now)
+            params.append(conv_id)
+            
+            cursor = conn.execute(
+                f"UPDATE conversations SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            conn.commit()
+            
+            return cursor.rowcount > 0
     
     def get_conversation(self, conv_id: str) -> dict | None:
         """
@@ -515,7 +574,7 @@ class ConversationStore:
             conv_id: Conversation ID
         
         Returns:
-            Dict with conversation metadata, message count, and entity count
+            Dict with conversation metadata, message count, entity count, and preview
         """
         with self._get_connection() as conn:
             conv = conn.execute(
@@ -536,11 +595,77 @@ class ConversationStore:
                 (conv_id,),
             ).fetchone()["count"]
             
+            # Get first user message as preview
+            first_msg = conn.execute(
+                """
+                SELECT content FROM messages 
+                WHERE conversation_id = ? AND role = 'user'
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (conv_id,),
+            ).fetchone()
+            
+            preview = first_msg["content"][:100] if first_msg else None
+            
             return {
                 **dict(conv),
                 "message_count": msg_count,
                 "entity_count": entity_count,
+                "preview": preview,
             }
+    
+    def list_conversations_with_preview(
+        self,
+        user_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """
+        List conversations with preview of first message.
+        
+        Args:
+            user_id: Optional user filter
+            limit: Maximum conversations to return
+        
+        Returns:
+            List of conversation dicts with preview
+        """
+        with self._get_connection() as conn:
+            if user_id:
+                rows = conn.execute(
+                    """
+                    SELECT c.*, 
+                           (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) as message_count,
+                           (SELECT content FROM messages WHERE conversation_id = c.id AND role = 'user' ORDER BY created_at ASC LIMIT 1) as preview
+                    FROM conversations c
+                    WHERE c.user_id = ?
+                    ORDER BY c.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (user_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT c.*, 
+                           (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) as message_count,
+                           (SELECT content FROM messages WHERE conversation_id = c.id AND role = 'user' ORDER BY created_at ASC LIMIT 1) as preview
+                    FROM conversations c
+                    ORDER BY c.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            
+            result = []
+            for row in rows:
+                d = dict(row)
+                # Truncate preview
+                if d.get("preview"):
+                    d["preview"] = d["preview"][:100]
+                result.append(d)
+            
+            return result
     
     # ============================================
     # Multi-Turn Conversation State Management

@@ -432,7 +432,14 @@ User message: {text}
 Return JSON (ALL fields required, use empty arrays [] if none):
 {{
     "entities": [
-        {{"name": "Properly Capitalized Name", "type": "person|project|goal|event|period", "context": "..."}}
+        {{
+            "name": "Properly Capitalized Name", 
+            "type": "person|project|goal|event|period", 
+            "context": "Brief description",
+            "start_date": "YYYY-MM-DD or null",
+            "end_date": "YYYY-MM-DD or null",
+            "on_date": "YYYY-MM-DD or null (for events only)"
+        }}
     ],
     "relationships": [
         {{"source_name": "...", "target_name": "...", "type": "...", "reason": "..."}}
@@ -442,6 +449,14 @@ Return JSON (ALL fields required, use empty arrays [] if none):
     ],
     "message": "Brief summary"
 }}
+
+DATE EXTRACTION RULES:
+- For periods: Extract start_date and end_date as YYYY-MM-DD (use today's date: {today} to calculate relative dates)
+- "Starting feb 17" → start_date: "{date.today().year}-02-17" (assume current year unless specified)
+- "From May 2024 to Jan 28" → start_date: "2024-05-01", end_date: "{date.today().year}-01-28"
+- "Next month" → calculate actual date from today
+- For events: Use on_date field instead of start_date
+- Use null for unknown dates (NOT an empty string)
 
 REMEMBER: New jobs, positions, life phases are PERIODS, not events!"""
 

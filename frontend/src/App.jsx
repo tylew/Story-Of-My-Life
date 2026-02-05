@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import GraphView from './components/GraphView'
-import ConversationalChat from './components/ConversationalChat'
+import ChatManager from './components/ChatManager'
 import Sidebar from './components/Sidebar'
 import EntityDetail from './components/EntityDetail'
 import EntityList from './components/EntityList'
@@ -102,7 +102,7 @@ function App() {
       case 'documents':
         return <DocumentBrowser onDocumentSelect={handleDocumentSelect} onEntitySelect={handleEntitySelect} refreshKey={refreshKey} />
       case 'assistant':
-        return <ConversationalChat onEntityCreated={handleRefresh} onEntitySelect={handleEntitySelect} fullPage />
+        return <ChatManager onEntityCreated={handleRefresh} onEntitySelect={handleEntitySelect} fullPage />
       default:
         return <Dashboard status={status} onEntitySelect={handleEntitySelect} onRefresh={handleRefresh} onNavigate={setActiveTab} />
     }
