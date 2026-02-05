@@ -1,0 +1,190 @@
+# Story of My Life - Development Environment
+# All services containerized for consistent development
+#
+# Create a .env file with your API key:
+#   SOML_OPENAI_API_KEY=sk-your-key-here
+
+services:
+  # ============================================
+  # Neo4j - Graph Database + Vector Storage
+  # ============================================
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: soml-neo4j
+    ports:
+      - "7474:7474"  # HTTP Browser
+      - "7687:7687"  # Bolt protocol
+    environment:
+      - NEO4J_AUTH=neo4j/somlpassword123
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - soml-network
+
+  # ============================================
+  # SOML App - Main Application Container
+  # ============================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: soml-app
+    volumes:
+      # Mount source code for development
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./scripts:/app/scripts
+      # Mount data directory
+      - soml_data:/data
+      # Mount SQLite registry
+      - soml_index:/data/.index
+    env_file:
+      - .env
+    environment:
+      - SOML_NEO4J_URI=bolt://neo4j:7687
+      - SOML_NEO4J_USER=neo4j
+      - SOML_NEO4J_PASSWORD=somlpassword123
+      - SOML_DATA_DIR=/data
+      - PYTHONPATH=/app/src
+      - OPENAI_API_KEY=${SOML_OPENAI_API_KEY}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - soml-network
+    stdin_open: true
+    tty: true
+
+  # ============================================
+  # API Server - FastAPI Backend
+  # ============================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: soml-api
+    command: uvicorn soml.interface.api:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - soml_data:/data
+      - soml_index:/data/.index
+    env_file:
+      - .env
+    environment:
+      - SOML_NEO4J_URI=bolt://neo4j:7687
+      - SOML_NEO4J_USER=neo4j
+      - SOML_NEO4J_PASSWORD=somlpassword123
+      - SOML_DATA_DIR=/data
+      - PYTHONPATH=/app/src
+      - OPENAI_API_KEY=${SOML_OPENAI_API_KEY}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - soml-network
+
+  # ============================================
+  # Frontend - React UI
+  # ============================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: soml-frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+    environment:
+      - VITE_API_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - soml-network
+
+  # ============================================
+  # MCP Server - Model Context Protocol
+  # ============================================
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: soml-mcp
+    command: python -m soml.interface.mcp_server
+    ports:
+      - "8765:8765"  # MCP WebSocket
+    volumes:
+      - ./src:/app/src
+      - soml_data:/data
+      - soml_index:/data/.index
+    env_file:
+      - .env
+    environment:
+      - SOML_NEO4J_URI=bolt://neo4j:7687
+      - SOML_NEO4J_USER=neo4j
+      - SOML_NEO4J_PASSWORD=somlpassword123
+      - SOML_DATA_DIR=/data
+      - PYTHONPATH=/app/src
+      - OPENAI_API_KEY=${SOML_OPENAI_API_KEY}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - soml-network
+
+  # ============================================
+  # Test Runner - For CI/CD
+  # ============================================
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: soml-test
+    command: pytest --cov=soml tests/ -v
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+    environment:
+      - SOML_NEO4J_URI=bolt://neo4j:7687
+      - SOML_NEO4J_USER=neo4j
+      - SOML_NEO4J_PASSWORD=somlpassword123
+      - SOML_DATA_DIR=/tmp/test_data
+      - PYTHONPATH=/app/src
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - soml-network
+    profiles:
+      - test
+
+volumes:
+  neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local
+  neo4j_import:
+    driver: local
+  soml_data:
+    driver: local
+  soml_index:
+    driver: local
+
+networks:
+  soml-network:
+    driver: bridge
+

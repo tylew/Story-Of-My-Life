@@ -1,0 +1,30 @@
+# Development Dockerfile for Frontend with Vite HMR
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies first (for caching)
+COPY package.json package-lock.json* ./
+RUN npm install
+
+# Copy configuration files
+COPY vite.config.js .
+COPY tailwind.config.js .
+COPY postcss.config.js .
+COPY index.html .
+
+# Copy source (will be overridden by volume mount)
+COPY src ./src
+COPY public ./public
+
+# Expose Vite dev server and HMR ports
+EXPOSE 3000
+EXPOSE 24678
+
+# Environment for development
+ENV NODE_ENV=development
+ENV CHOKIDAR_USEPOLLING=true
+
+# Start Vite dev server
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
