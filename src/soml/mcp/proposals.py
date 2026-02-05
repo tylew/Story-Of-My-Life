@@ -118,6 +118,29 @@ class RelationshipProposal:
     
     target_entity_id: str | None = None
     """Resolved target ID (after entity selection)."""
+    
+    # New fields for enhanced relationship management
+    direction: Literal["outgoing", "incoming", "bidirectional"] = "outgoing"
+    """Direction of the relationship from source's perspective.
+    - outgoing: source -> target (default)
+    - incoming: source <- target  
+    - bidirectional: source <-> target
+    """
+    
+    editable: bool = True
+    """Whether user can edit this proposal."""
+    
+    user_modified_type: str | None = None
+    """If user changed the relationship type, store here."""
+    
+    user_modified_direction: Literal["outgoing", "incoming", "bidirectional"] | None = None
+    """If user changed the direction."""
+    
+    source_candidates: list[dict] | None = None
+    """Available entity candidates for source (for editing)."""
+    
+    target_candidates: list[dict] | None = None
+    """Available entity candidates for target (for editing)."""
 
 
 @dataclass
@@ -424,8 +447,16 @@ class ProposalGenerator:
         rel_type: str,
         reason: str | None,
         entity_proposals: list[EntityProposal],
+        direction: str = "outgoing",
     ) -> RelationshipProposal:
-        """Generate a proposal for a relationship."""
+        """Generate a proposal for a relationship.
+        
+        Resolves entity names in this order:
+        1. Check entity_proposals from current extraction
+        2. Search registry for existing entities
+        
+        Also populates entity candidates for user editing.
+        """
         
         proposal = RelationshipProposal(
             proposal_id=str(uuid4()),
@@ -434,25 +465,150 @@ class ProposalGenerator:
             target_mention=target_name,
             relationship_type=rel_type,
             reason=reason,
+            direction=direction,
+            editable=True,
         )
         
-        # Check if we need to do a replace instead of add
-        # This requires checking existing relationships between the entities
+        # Collect candidates for source entity
+        source_candidates = []
         source_proposal = next((p for p in entity_proposals if p.mention.lower() == source_name.lower()), None)
-        target_proposal = next((p for p in entity_proposals if p.mention.lower() == target_name.lower()), None)
+        source_id = None
         
-        if source_proposal and target_proposal:
-            # Find if there's already a relationship between high-confidence candidates
-            for s_cand in source_proposal.candidates[:1]:  # Check top candidate
-                if s_cand.id:
-                    for t_cand in target_proposal.candidates[:1]:
-                        if t_cand.id:
-                            existing = self._check_existing_relationship(s_cand.id, t_cand.id)
-                            if existing:
-                                proposal.action = "replace"
-                                proposal.old_type = existing.get("type")
+        if source_proposal:
+            # Use candidates from entity proposals
+            source_candidates = [
+                {"id": c.id, "name": c.name, "type": c.type, "score": c.match_score}
+                for c in source_proposal.candidates if not c.is_create_new
+            ]
+            # Use top candidate
+            for cand in source_proposal.candidates:
+                if cand.id and not cand.is_create_new and cand.match_score >= 0.85:
+                    source_id = cand.id
+                    break
+        
+        if not source_id:
+            # Search registry for existing entity
+            source_id, additional_candidates = self._resolve_existing_entity_with_candidates(source_name)
+            if source_id:
+                proposal.source_entity_id = source_id
+            source_candidates.extend(additional_candidates)
+        
+        proposal.source_candidates = source_candidates if source_candidates else None
+        
+        # Collect candidates for target entity
+        target_candidates = []
+        target_proposal = next((p for p in entity_proposals if p.mention.lower() == target_name.lower()), None)
+        target_id = None
+        
+        if target_proposal:
+            # Use candidates from entity proposals
+            target_candidates = [
+                {"id": c.id, "name": c.name, "type": c.type, "score": c.match_score}
+                for c in target_proposal.candidates if not c.is_create_new
+            ]
+            # Use top candidate
+            for cand in target_proposal.candidates:
+                if cand.id and not cand.is_create_new and cand.match_score >= 0.85:
+                    target_id = cand.id
+                    break
+        
+        if not target_id:
+            # Search registry for existing entity
+            target_id, additional_candidates = self._resolve_existing_entity_with_candidates(target_name)
+            if target_id:
+                proposal.target_entity_id = target_id
+            target_candidates.extend(additional_candidates)
+        
+        proposal.target_candidates = target_candidates if target_candidates else None
+        
+        # Check if we need to do a replace instead of add
+        if source_id and target_id:
+            existing = self._check_existing_relationship(source_id, target_id)
+            if existing:
+                proposal.action = "replace"
+                proposal.old_type = existing.get("type")
         
         return proposal
+    
+    def _resolve_existing_entity(self, name: str) -> str | None:
+        """
+        Resolve a name to an existing entity ID in the registry.
+        
+        Searches across all entity types using fuzzy matching.
+        """
+        entity_id, _ = self._resolve_existing_entity_with_candidates(name)
+        return entity_id
+    
+    def _resolve_existing_entity_with_candidates(self, name: str) -> tuple[str | None, list[dict]]:
+        """
+        Resolve a name to an existing entity ID and return all candidates.
+        
+        Returns:
+            Tuple of (best_match_id, list of candidate dicts)
+        """
+        from soml.core.types import EntityType
+        
+        candidates = []
+        best_id = None
+        best_score = 0.0
+        
+        # Try resolution for each entity type
+        for entity_type in [EntityType.PERSON, EntityType.PROJECT, EntityType.PERIOD, EntityType.EVENT, EntityType.GOAL]:
+            result = self.resolver.resolve(name=name, entity_type=entity_type)
+            if result.found and result.entity_id:
+                if result.match_score > best_score:
+                    best_score = result.match_score
+                    best_id = result.entity_id
+                
+                # Add to candidates
+                candidates.append({
+                    "id": result.entity_id,
+                    "name": result.entity_name,
+                    "type": entity_type.value,
+                    "score": result.match_score,
+                })
+            
+            # Also add fuzzy matches as candidates
+            if result.candidates:
+                for cand in result.candidates:
+                    if cand.get("id") and cand.get("id") not in [c.get("id") for c in candidates]:
+                        candidates.append({
+                            "id": cand.get("id"),
+                            "name": cand.get("name"),
+                            "type": cand.get("type"),
+                            "score": cand.get("score", 0.5),
+                        })
+        
+        # Also try general registry search
+        matches = self.registry.search(name, limit=5)
+        for match in matches:
+            if match.get("id") not in [c.get("id") for c in candidates]:
+                match_name = match.get("name", "").lower()
+                search_name = name.lower()
+                
+                score = 0.5
+                if match_name == search_name:
+                    score = 1.0
+                elif search_name in match_name or match_name in search_name:
+                    shorter = min(len(match_name), len(search_name))
+                    longer = max(len(match_name), len(search_name))
+                    score = shorter / longer
+                
+                candidates.append({
+                    "id": match.get("id"),
+                    "name": match.get("name"),
+                    "type": match.get("type"),
+                    "score": score,
+                })
+                
+                if score > best_score:
+                    best_score = score
+                    best_id = match.get("id")
+        
+        # Sort by score
+        candidates.sort(key=lambda c: c.get("score", 0), reverse=True)
+        
+        return best_id, candidates
     
     def _check_existing_relationship(self, source_id: str, target_id: str) -> dict | None:
         """Check if a relationship already exists between two entities."""
@@ -506,6 +662,39 @@ class ProposalGenerator:
         )
 
 
+def _resolve_entity_for_relationship(resolver, registry, name: str) -> str | None:
+    """
+    Resolve an entity name to an ID for relationship creation.
+    
+    Searches across all entity types.
+    """
+    from soml.core.types import EntityType
+    
+    # Try resolution for each entity type
+    for entity_type in [EntityType.PERSON, EntityType.PROJECT, EntityType.PERIOD, EntityType.EVENT, EntityType.GOAL]:
+        result = resolver.resolve(name=name, entity_type=entity_type)
+        if result.found and result.entity_id:
+            return result.entity_id
+    
+    # Try general registry search
+    matches = registry.search(name, limit=5)
+    if matches:
+        for match in matches:
+            match_name = match.get("name", "").lower()
+            search_name = name.lower()
+            
+            if match_name == search_name:
+                return match.get("id")
+            
+            if search_name in match_name or match_name in search_name:
+                shorter = min(len(match_name), len(search_name))
+                longer = max(len(match_name), len(search_name))
+                if shorter / longer > 0.5:
+                    return match.get("id")
+    
+    return None
+
+
 def proposal_set_to_dict(proposal_set: ProposalSet) -> dict:
     """Convert a ProposalSet to a JSON-serializable dict."""
     return {
@@ -548,6 +737,12 @@ def proposal_set_to_dict(proposal_set: ProposalSet) -> dict:
                 "old_type": p.old_type,
                 "reason": p.reason,
                 "approved": p.approved,
+                "direction": p.direction,
+                "editable": p.editable,
+                "source_entity_id": p.source_entity_id,
+                "target_entity_id": p.target_entity_id,
+                "source_candidates": p.source_candidates,
+                "target_candidates": p.target_candidates,
             }
             for p in proposal_set.relationship_proposals
         ],
@@ -796,6 +991,11 @@ def execute_approved_proposals(
     
     # Process relationship approvals
     relationship_approvals = user_selections.get("relationship_approvals", {})
+    relationship_edits = user_selections.get("relationship_edits", {})
+    
+    # Create resolver for looking up existing entities
+    from soml.mcp.resolution import EntityResolver
+    resolver = EntityResolver()
     
     for proposal in proposal_set.relationship_proposals:
         approved = relationship_approvals.get(proposal.proposal_id)
@@ -803,29 +1003,79 @@ def execute_approved_proposals(
         if not approved:
             continue
         
+        # Check for user edits
+        edits = relationship_edits.get(proposal.proposal_id, {})
+        
+        # Apply user modifications if any
+        rel_type = edits.get("relationship_type") or proposal.user_modified_type or proposal.relationship_type
+        direction = edits.get("direction") or proposal.user_modified_direction or proposal.direction
+        
+        # Allow user to override source/target
+        user_source_id = edits.get("source_id")
+        user_target_id = edits.get("target_id")
+        
         # Resolve source and target IDs
-        source_id = mention_to_id.get(proposal.source_mention.lower())
-        target_id = mention_to_id.get(proposal.target_mention.lower())
+        # First check user overrides
+        if user_source_id:
+            source_id = user_source_id
+        else:
+            # Check mention_to_id from current proposals
+            source_id = mention_to_id.get(proposal.source_mention.lower())
+            # Use pre-resolved IDs from proposal if available
+            if not source_id and proposal.source_entity_id:
+                source_id = proposal.source_entity_id
+            # If still not found, search the registry
+            if not source_id:
+                source_id = _resolve_entity_for_relationship(resolver, registry, proposal.source_mention)
+        
+        if user_target_id:
+            target_id = user_target_id
+        else:
+            target_id = mention_to_id.get(proposal.target_mention.lower())
+            if not target_id and proposal.target_entity_id:
+                target_id = proposal.target_entity_id
+            if not target_id:
+                target_id = _resolve_entity_for_relationship(resolver, registry, proposal.target_mention)
         
         if not source_id or not target_id:
+            missing = []
+            if not source_id:
+                missing.append(proposal.source_mention)
+            if not target_id:
+                missing.append(proposal.target_mention)
             results["errors"].append(
-                f"Cannot create relationship: {proposal.source_mention} or {proposal.target_mention} not resolved"
+                f"Cannot create relationship: could not resolve {', '.join(missing)}"
             )
             continue
+        
+        # Handle direction
+        # For "incoming" direction, swap source and target
+        if direction == "incoming":
+            source_id, target_id = target_id, source_id
         
         if proposal.action == "add":
             result = mcp_tools.add_relationship(
                 source_id=source_id,
                 target_id=target_id,
-                rel_type=proposal.relationship_type,
+                rel_type=rel_type,
                 reason=proposal.reason,
             )
+            
+            # For bidirectional relationships, also create the reverse
+            if direction == "bidirectional" and result.action in ["created", "updated"]:
+                mcp_tools.add_relationship(
+                    source_id=target_id,
+                    target_id=source_id,
+                    rel_type=rel_type,
+                    reason=f"Bidirectional: {proposal.reason}" if proposal.reason else "Bidirectional relationship",
+                )
+                
         elif proposal.action == "replace":
             result = mcp_tools.replace_relationship(
                 source_id=source_id,
                 target_id=target_id,
                 old_type=proposal.old_type,
-                new_type=proposal.relationship_type,
+                new_type=rel_type,
                 reason=proposal.reason,
             )
         else:
@@ -835,7 +1085,8 @@ def execute_approved_proposals(
             results["relationships_created"].append({
                 "source_id": source_id,
                 "target_id": target_id,
-                "type": proposal.relationship_type,
+                "type": rel_type,
+                "direction": direction,
             })
         else:
             results["errors"].append(f"Relationship failed: {result.error}")

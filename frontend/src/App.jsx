@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import GraphView from './components/GraphView'
 import ChatManager from './components/ChatManager'
 import Sidebar from './components/Sidebar'
@@ -10,6 +10,7 @@ import OpenLoops from './components/OpenLoops'
 import SearchModal from './components/SearchModal'
 import DocumentBrowser from './components/DocumentBrowser'
 import DocumentView from './components/DocumentView'
+import RelationshipsBetweenEntities from './components/RelationshipsBetweenEntities'
 import { Brain, Search, Bell } from 'lucide-react'
 
 const API_BASE = '/api'
@@ -18,11 +19,13 @@ function App() {
   const [activeTab, setActiveTab] = useState('dashboard')
   const [selectedEntity, setSelectedEntity] = useState(null)
   const [selectedDocument, setSelectedDocument] = useState(null)
+  const [selectedRelationshipPair, setSelectedRelationshipPair] = useState(null) // { sourceEntity, targetEntity }
   const [status, setStatus] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [searchOpen, setSearchOpen] = useState(false)
   const [openLoopsCount, setOpenLoopsCount] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
+  const graphRef = useRef(null)
 
   useEffect(() => {
     fetchStatus()
@@ -43,6 +46,18 @@ function App() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  // Handle entity selection from EntityDetail relationships tab
+  useEffect(() => {
+    const handleEntitySelectEvent = (e) => {
+      if (e.detail) {
+        setSelectedEntity(e.detail)
+        setSelectedDocument(null)
+      }
+    }
+    window.addEventListener('entity-select', handleEntitySelectEvent)
+    return () => window.removeEventListener('entity-select', handleEntitySelectEvent)
   }, [])
 
   const fetchStatus = async () => {
@@ -67,12 +82,28 @@ function App() {
 
   const handleEntitySelect = useCallback((entity) => {
     setSelectedEntity(entity)
-    setSelectedDocument(null) // Close document view when selecting entity
+    setSelectedDocument(null)
+    setSelectedRelationshipPair(null)
+    // Focus on entity in graph if we're on graph view
+    if (graphRef.current && entity?.id) {
+      graphRef.current.focusNode(entity.id)
+    }
   }, [])
 
   const handleDocumentSelect = useCallback((doc) => {
     setSelectedDocument(doc)
-    setSelectedEntity(null) // Close entity detail when selecting document
+    setSelectedEntity(null)
+    setSelectedRelationshipPair(null)
+  }, [])
+
+  const handleRelationshipPairSelect = useCallback((sourceEntity, targetEntity) => {
+    setSelectedRelationshipPair({ sourceEntity, targetEntity })
+    setSelectedEntity(null)
+    setSelectedDocument(null)
+    // Focus on the link in graph
+    if (graphRef.current && sourceEntity?.id && targetEntity?.id) {
+      graphRef.current.focusLink(sourceEntity.id, targetEntity.id)
+    }
   }, [])
 
   const handleRefresh = useCallback(() => {
@@ -84,7 +115,19 @@ function App() {
       case 'dashboard':
         return <Dashboard status={status} onEntitySelect={handleEntitySelect} onRefresh={handleRefresh} onNavigate={setActiveTab} />
       case 'graph':
-        return <GraphView onNodeSelect={handleEntitySelect} refreshKey={refreshKey} />
+        return (
+          <GraphView 
+            ref={graphRef}
+            onNodeSelect={handleEntitySelect} 
+            onLinkSelect={handleRelationshipPairSelect}
+            refreshKey={refreshKey}
+            highlightedNodeId={selectedEntity?.id}
+            highlightedLink={selectedRelationshipPair ? {
+              sourceId: selectedRelationshipPair.sourceEntity?.id,
+              targetId: selectedRelationshipPair.targetEntity?.id,
+            } : null}
+          />
+        )
       case 'people':
         return <EntityList type="people" onEntitySelect={handleEntitySelect} refreshKey={refreshKey} />
       case 'projects':
@@ -189,6 +232,7 @@ function App() {
               onClose={() => setSelectedEntity(null)}
               onRefresh={handleRefresh}
               onDocumentSelect={handleDocumentSelect}
+              onRelationshipPairSelect={handleRelationshipPairSelect}
             />
           )}
 
@@ -197,6 +241,17 @@ function App() {
             <DocumentView
               document={selectedDocument}
               onClose={() => setSelectedDocument(null)}
+              onRefresh={handleRefresh}
+            />
+          )}
+
+          {/* Relationships Between Entities Panel */}
+          {selectedRelationshipPair && (
+            <RelationshipsBetweenEntities
+              sourceEntity={selectedRelationshipPair.sourceEntity}
+              targetEntity={selectedRelationshipPair.targetEntity}
+              onClose={() => setSelectedRelationshipPair(null)}
+              onEntitySelect={handleEntitySelect}
               onRefresh={handleRefresh}
             />
           )}

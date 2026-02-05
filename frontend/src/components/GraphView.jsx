@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo, forwardRef, useImperativeHandle } from 'react'
 import ForceGraph2D from 'react-force-graph-2d'
 import { 
   ZoomIn, ZoomOut, Maximize, RefreshCw, Eye, EyeOff, 
@@ -18,7 +18,13 @@ const nodeColors = {
   period: '#f97316',   // orange
 }
 
-export default function GraphView({ onNodeSelect, refreshKey }) {
+const GraphView = forwardRef(function GraphView({ 
+  onNodeSelect, 
+  onLinkSelect,
+  refreshKey,
+  highlightedNodeId,
+  highlightedLink, // { sourceId, targetId }
+}, ref) {
   const graphRef = useRef()
   const [graphData, setGraphData] = useState({ nodes: [], links: [] })
   const [loading, setLoading] = useState(true)
@@ -39,6 +45,7 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
   const [quickActionsPos, setQuickActionsPos] = useState({ x: 0, y: 0 })
 
   // Filter graph data based on visible types - must be before effects that use it
+  // Also aggregate multiple relationships between the same nodes
   const filteredGraphData = useMemo(() => {
     const visibleNodes = graphData.nodes.filter(node => visibleTypes[node.type])
     const visibleNodeIds = new Set(visibleNodes.map(n => n.id))
@@ -46,8 +53,59 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
       link => visibleNodeIds.has(link.source?.id || link.source) && 
               visibleNodeIds.has(link.target?.id || link.target)
     )
-    return { nodes: visibleNodes, links: visibleLinks }
+    
+    // Group links by source-target pair (ignoring direction)
+    const linkGroups = new Map()
+    visibleLinks.forEach(link => {
+      const sourceId = link.source?.id || link.source
+      const targetId = link.target?.id || link.target
+      // Normalize the key so A-B and B-A are the same
+      const key = [sourceId, targetId].sort().join('|')
+      if (!linkGroups.has(key)) {
+        linkGroups.set(key, {
+          source: sourceId,
+          target: targetId,
+          links: [],
+        })
+      }
+      linkGroups.get(key).links.push(link)
+    })
+    
+    // Create aggregated links with count
+    const aggregatedLinks = Array.from(linkGroups.values()).map(group => ({
+      source: group.source,
+      target: group.target,
+      type: group.links.length === 1 ? group.links[0].type : null,
+      label: group.links.length === 1 ? group.links[0].label : `${group.links.length} relationships`,
+      count: group.links.length,
+      allLinks: group.links,
+    }))
+    
+    return { nodes: visibleNodes, links: aggregatedLinks }
   }, [graphData, visibleTypes])
+
+  // Expose methods to parent via ref
+  useImperativeHandle(ref, () => ({
+    focusNode: (nodeId) => {
+      if (!graphRef.current) return
+      const node = filteredGraphData.nodes.find(n => n.id === nodeId)
+      if (node) {
+        graphRef.current.centerAt(node.x, node.y, 500)
+        graphRef.current.zoom(2, 500)
+      }
+    },
+    focusLink: (sourceId, targetId) => {
+      if (!graphRef.current) return
+      const sourceNode = filteredGraphData.nodes.find(n => n.id === sourceId)
+      const targetNode = filteredGraphData.nodes.find(n => n.id === targetId)
+      if (sourceNode && targetNode) {
+        const midX = (sourceNode.x + targetNode.x) / 2
+        const midY = (sourceNode.y + targetNode.y) / 2
+        graphRef.current.centerAt(midX, midY, 500)
+        graphRef.current.zoom(1.8, 500)
+      }
+    },
+  }), [filteredGraphData.nodes])
 
   // Fetch graph data on mount and when refreshKey changes
   useEffect(() => {
@@ -139,8 +197,15 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
   }
 
   const handleNodeClick = useCallback((node, event) => {
+    // Normalize entity to have both name and label
+    const entity = {
+      ...node,
+      name: node.name || node.label,
+      label: node.label || node.name,
+    }
+    
     // Open detail panel
-    onNodeSelect(node)
+    onNodeSelect(entity)
     
     // Center on node
     if (graphRef.current) {
@@ -212,14 +277,26 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
     ctx.font = `${fontSize}px 'Space Grotesk', sans-serif`
     
     const isHovered = hoveredNode?.id === node.id
-    const nodeRadius = isHovered ? 10 : 7
+    const isHighlighted = highlightedNodeId === node.id || 
+      (highlightedLink && (highlightedLink.sourceId === node.id || highlightedLink.targetId === node.id))
+    const isSelected = isHovered || isHighlighted
+    const nodeRadius = isSelected ? 10 : 7
     
-    // Draw glow for hovered nodes
-    if (isHovered) {
+    // Draw glow for selected/highlighted nodes
+    if (isSelected) {
       ctx.beginPath()
-      ctx.arc(node.x, node.y, nodeRadius + 6, 0, 2 * Math.PI, false)
-      ctx.fillStyle = `${node.color}33`
+      ctx.arc(node.x, node.y, nodeRadius + 8, 0, 2 * Math.PI, false)
+      ctx.fillStyle = isHighlighted ? 'rgba(255, 255, 255, 0.15)' : `${node.color}33`
       ctx.fill()
+      
+      // Extra glow ring for highlighted
+      if (isHighlighted) {
+        ctx.beginPath()
+        ctx.arc(node.x, node.y, nodeRadius + 4, 0, 2 * Math.PI, false)
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)'
+        ctx.lineWidth = 2
+        ctx.stroke()
+      }
     }
     
     // Draw node circle
@@ -229,18 +306,18 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
     ctx.fill()
     
     // Draw border
-    ctx.strokeStyle = isHovered ? 'white' : `${node.color}aa`
-    ctx.lineWidth = isHovered ? 2 : 1
+    ctx.strokeStyle = isSelected ? 'white' : `${node.color}aa`
+    ctx.lineWidth = isSelected ? 2 : 1
     ctx.stroke()
     
     // Draw label
-    if (globalScale > 0.5 || isHovered) {
+    if (globalScale > 0.5 || isSelected) {
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
-      ctx.fillStyle = isHovered ? 'white' : 'rgba(255, 255, 255, 0.85)'
+      ctx.fillStyle = isSelected ? 'white' : 'rgba(255, 255, 255, 0.85)'
       ctx.fillText(label, node.x, node.y + nodeRadius + fontSize + 2)
     }
-  }, [hoveredNode])
+  }, [hoveredNode, highlightedNodeId, highlightedLink])
 
   const linkCanvasObject = useCallback((link, ctx, globalScale) => {
     const start = link.source
@@ -248,19 +325,62 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
     
     if (typeof start !== 'object' || typeof end !== 'object') return
     
-    // Draw line
+    const isMultiple = link.count > 1
+    const midX = (start.x + end.x) / 2
+    const midY = (start.y + end.y) / 2
+    
+    // Check if this link is highlighted
+    const isHighlighted = highlightedLink && (
+      (highlightedLink.sourceId === start.id && highlightedLink.targetId === end.id) ||
+      (highlightedLink.sourceId === end.id && highlightedLink.targetId === start.id)
+    )
+    
+    // Draw line (thicker for multi-relationships or highlighted)
     ctx.beginPath()
     ctx.moveTo(start.x, start.y)
     ctx.lineTo(end.x, end.y)
-    ctx.strokeStyle = 'rgba(168, 85, 247, 0.3)'
-    ctx.lineWidth = 1
-    ctx.stroke()
     
-    // Draw relationship label if enabled
-    if (showRelationshipLabels && link.label && globalScale > 0.8) {
-      const midX = (start.x + end.x) / 2
-      const midY = (start.y + end.y) / 2
+    if (isHighlighted) {
+      // Highlighted link - bright with glow effect
+      ctx.strokeStyle = 'rgba(168, 85, 247, 0.9)'
+      ctx.lineWidth = 3
+      ctx.stroke()
       
+      // Glow
+      ctx.beginPath()
+      ctx.moveTo(start.x, start.y)
+      ctx.lineTo(end.x, end.y)
+      ctx.strokeStyle = 'rgba(168, 85, 247, 0.3)'
+      ctx.lineWidth = 8
+      ctx.stroke()
+    } else {
+      ctx.strokeStyle = isMultiple ? 'rgba(168, 85, 247, 0.5)' : 'rgba(168, 85, 247, 0.3)'
+      ctx.lineWidth = isMultiple ? 2 : 1
+      ctx.stroke()
+    }
+    
+    // Draw multi-relationship badge
+    if (isMultiple) {
+      const badgeRadius = Math.max(10, 12 / globalScale)
+      
+      // Badge circle
+      ctx.beginPath()
+      ctx.arc(midX, midY, badgeRadius, 0, 2 * Math.PI, false)
+      ctx.fillStyle = isHighlighted ? '#9333ea' : '#7c3aed' // brighter when highlighted
+      ctx.fill()
+      ctx.strokeStyle = isHighlighted ? 'white' : 'rgba(255, 255, 255, 0.5)'
+      ctx.lineWidth = isHighlighted ? 2 : 1
+      ctx.stroke()
+      
+      // Count text
+      const fontSize = Math.max(8, 10 / globalScale)
+      ctx.font = `bold ${fontSize}px 'Space Grotesk', sans-serif`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillStyle = 'white'
+      ctx.fillText(link.count.toString(), midX, midY)
+    } else if (showRelationshipLabels && link.label && globalScale > 0.8) {
+      // Draw single relationship label if enabled
       const fontSize = Math.max(8, 10 / globalScale)
       ctx.font = `${fontSize}px 'Space Grotesk', sans-serif`
       ctx.textAlign = 'center'
@@ -272,10 +392,34 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
       ctx.fillRect(midX - textWidth/2 - 4, midY - fontSize/2 - 2, textWidth + 8, fontSize + 4)
       
       // Text
-      ctx.fillStyle = 'rgba(168, 85, 247, 0.8)'
+      ctx.fillStyle = isHighlighted ? 'rgba(168, 85, 247, 1)' : 'rgba(168, 85, 247, 0.8)'
       ctx.fillText(link.label, midX, midY)
     }
-  }, [showRelationshipLabels])
+  }, [showRelationshipLabels, highlightedLink])
+  
+  // Handle link click to open relationship sidebar
+  const handleLinkClick = useCallback((link) => {
+    if (!link || typeof link.source !== 'object' || typeof link.target !== 'object') return
+    
+    // Find the node entities
+    const sourceNode = graphData.nodes.find(n => n.id === link.source.id) || link.source
+    const targetNode = graphData.nodes.find(n => n.id === link.target.id) || link.target
+    
+    // Normalize entities to have both name and label (graph uses label, components use name)
+    const sourceEntity = {
+      ...sourceNode,
+      name: sourceNode.name || sourceNode.label,
+      label: sourceNode.label || sourceNode.name,
+    }
+    const targetEntity = {
+      ...targetNode,
+      name: targetNode.name || targetNode.label,
+      label: targetNode.label || targetNode.name,
+    }
+    
+    // Call the parent handler to open the sidebar
+    onLinkSelect?.(sourceEntity, targetEntity)
+  }, [graphData.nodes, onLinkSelect])
 
   // Quick action handlers
   const handleQuickAction = (action, node) => {
@@ -338,6 +482,7 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
           onNodeClick={handleNodeClick}
           onNodeHover={handleNodeHover}
           onNodeRightClick={handleNodeRightClick}
+          onLinkClick={handleLinkClick}
           nodeRelSize={6}
           linkWidth={1}
           linkColor={() => 'rgba(168, 85, 247, 0.2)'}
@@ -347,6 +492,19 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
           d3AlphaDecay={0.02}
           d3VelocityDecay={0.3}
           onEngineStop={() => graphRef.current?.zoomToFit(400, 50)}
+          linkPointerAreaPaint={(link, paintColor, ctx) => {
+            // Make links easier to click
+            const start = link.source
+            const end = link.target
+            if (typeof start !== 'object' || typeof end !== 'object') return
+            
+            ctx.beginPath()
+            ctx.moveTo(start.x, start.y)
+            ctx.lineTo(end.x, end.y)
+            ctx.strokeStyle = paintColor
+            ctx.lineWidth = 10 // Wide clickable area
+            ctx.stroke()
+          }}
         />
       )}
 
@@ -577,6 +735,9 @@ export default function GraphView({ onNodeSelect, refreshKey }) {
           <span className="text-xs text-slate-500 ml-2">Click to view • Right-click for actions</span>
         </div>
       )}
+      
     </div>
   )
-}
+})
+
+export default GraphView

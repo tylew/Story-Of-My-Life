@@ -62,6 +62,11 @@ body {
   to { opacity: 1; transform: translateX(0); }
 }
 
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
 @keyframes pulse-border {
   0%, 100% { border-color: rgba(168, 85, 247, 0.3); }
   50% { border-color: rgba(168, 85, 247, 0.8); }
@@ -73,6 +78,10 @@ body {
 
 .animate-slide-in {
   animation: slideIn 0.3s ease-out;
+}
+
+.animate-scale-in {
+  animation: scaleIn 0.2s ease-out;
 }
 
 /* Glass morphism */

@@ -589,6 +589,238 @@ async def delete_entity(entity_id: str, hard_delete: bool = False):
 
 
 # ==========================================
+# Relationship Endpoints
+# ==========================================
+
+class CreateRelationshipRequest(BaseModel):
+    source_id: str
+    target_id: str
+    relationship_type: str
+    direction: str = "outgoing"  # outgoing, incoming, bidirectional
+    properties: dict = {}
+    allow_multiple: bool = False
+
+class UpdateRelationshipRequest(BaseModel):
+    type: str | None = None
+    direction: str | None = None  # outgoing, incoming, bidirectional
+    context: str | None = None
+    notes: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+
+
+@app.get("/relationships/between")
+async def get_relationships_between(source_id: str, target_id: str):
+    """Get all relationships between two specific entities."""
+    try:
+        # Get all relationships from source
+        source_rels = graph_store.get_relationships(source_id)
+        
+        # Filter to only those connecting to target (in either direction)
+        between = []
+        for rel in source_rels:
+            if rel.get("other_id") == target_id:
+                between.append({
+                    **rel,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "direction": "outgoing",
+                })
+        
+        # Also check reverse direction
+        target_rels = graph_store.get_relationships(target_id)
+        for rel in target_rels:
+            if rel.get("other_id") == source_id:
+                # Check if this is already counted (avoid duplicates)
+                rel_id = rel.get("id")
+                if rel_id and not any(r.get("id") == rel_id for r in between):
+                    between.append({
+                        **rel,
+                        "source_id": target_id,
+                        "target_id": source_id,
+                        "direction": "incoming",  # from perspective of original source
+                    })
+        
+        return {"relationships": between, "count": len(between)}
+    except Exception as e:
+        logger.error(f"Error getting relationships between entities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/relationships/{relationship_id}")
+async def get_relationship(relationship_id: str):
+    """Get a specific relationship by ID."""
+    try:
+        with graph_store.session() as session:
+            result = session.run("""
+                MATCH (source:Entity)-[r:RELATES_TO {id: $rel_id}]->(target:Entity)
+                RETURN 
+                    r.id as id,
+                    r.type as type,
+                    r.category as category,
+                    r.direction as direction,
+                    r.strength as strength,
+                    r.sentiment as sentiment,
+                    r.confidence as confidence,
+                    r.context as context,
+                    r.notes as notes,
+                    r.started_at as started_at,
+                    r.ended_at as ended_at,
+                    r.created_at as created_at,
+                    r.source as source,
+                    source.id as source_id,
+                    source.name as source_name,
+                    target.id as target_id,
+                    target.name as target_name
+            """, rel_id=relationship_id)
+            
+            record = result.single()
+            if not record:
+                raise HTTPException(status_code=404, detail="Relationship not found")
+            
+            data = dict(record)
+            # Default direction to outgoing if not set
+            if not data.get("direction"):
+                data["direction"] = "outgoing"
+            
+            return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting relationship: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/relationships")
+async def create_relationship(request: CreateRelationshipRequest):
+    """Create a new relationship between entities."""
+    from soml.mcp import tools as mcp_tools
+    
+    try:
+        # Handle direction by swapping source/target for incoming
+        actual_source = request.source_id
+        actual_target = request.target_id
+        
+        if request.direction == "incoming":
+            actual_source = request.target_id
+            actual_target = request.source_id
+        
+        # Add direction to properties
+        props = request.properties.copy()
+        props["direction"] = request.direction
+        
+        result = mcp_tools.add_relationship(
+            source_id=actual_source,
+            target_id=actual_target,
+            rel_type=request.relationship_type,
+            properties=props,
+            allow_multiple=request.allow_multiple,
+        )
+        
+        # For bidirectional, create the reverse relationship too
+        if request.direction == "bidirectional" and result.action == "created":
+            reverse_props = props.copy()
+            reverse_props["direction"] = "bidirectional"
+            mcp_tools.add_relationship(
+                source_id=request.target_id,
+                target_id=request.source_id,
+                rel_type=request.relationship_type,
+                properties=reverse_props,
+                allow_multiple=True,  # Allow since main relationship exists
+            )
+        
+        if result.action == "created":
+            return {
+                "success": True,
+                "action": "created",
+                "relationship_id": result.relationship_id,
+                "direction": request.direction,
+            }
+        elif result.action == "exists":
+            return {
+                "success": True,
+                "action": "exists",
+                "relationship_id": result.relationship_id,
+                "message": "Relationship already exists",
+            }
+        else:
+            raise HTTPException(status_code=500, detail=result.error or "Failed to create relationship")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating relationship: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/relationships/{relationship_id}")
+async def update_relationship(relationship_id: str, request: UpdateRelationshipRequest):
+    """Update a relationship's properties."""
+    try:
+        # Build update dict from non-None values
+        updates = request.model_dump(exclude_none=True)
+        
+        if not updates:
+            return {"success": True, "message": "No updates provided"}
+        
+        # Add updated_at timestamp
+        updates["updated_at"] = datetime.now().isoformat()
+        
+        with graph_store.session() as session:
+            # Update the relationship
+            result = session.run("""
+                MATCH (source:Entity)-[r:RELATES_TO {id: $rel_id}]->(target:Entity)
+                SET r += $updates
+                RETURN r.id as id, r.type as type
+            """, rel_id=relationship_id, updates=updates)
+            
+            record = result.single()
+            if not record:
+                raise HTTPException(status_code=404, detail="Relationship not found")
+        
+        return {
+            "success": True,
+            "message": "Relationship updated",
+            "relationship_id": relationship_id,
+            "updated_fields": list(updates.keys()),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating relationship: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/relationships/{relationship_id}")
+async def delete_relationship_endpoint(relationship_id: str):
+    """Delete a relationship by ID."""
+    try:
+        with graph_store.session() as session:
+            # Delete the relationship
+            result = session.run("""
+                MATCH (source:Entity)-[r:RELATES_TO {id: $rel_id}]->(target:Entity)
+                DELETE r
+                RETURN count(*) as deleted
+            """, rel_id=relationship_id)
+            
+            record = result.single()
+            if not record or record["deleted"] == 0:
+                raise HTTPException(status_code=404, detail="Relationship not found")
+        
+        logger.info(f"Deleted relationship {relationship_id}")
+        
+        return {
+            "success": True,
+            "message": "Relationship deleted",
+            "relationship_id": relationship_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting relationship: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
 # Period Endpoints
 # ==========================================
 

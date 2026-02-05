@@ -45,44 +45,81 @@ class RelationshipCategory(str, Enum):
 
 
 class PersonalRelationshipType(str, Enum):
-    """Types of personal (human-to-human) relationships."""
+    """Types of personal (human-to-human) relationships.
+    
+    Note: Multiple relationships of the same type between entities are allowed.
+    Each relationship can have rich data: strength, sentiment, context, etc.
+    """
+    # Friendship/Social
     FRIEND = "friend"
+    ACQUAINTANCE = "acquaintance"
+    
+    # Family
     FAMILY = "family"
     PARTNER = "partner"
-    # Employment-based relationships (current)
+    
+    # Employment-based (current)
     WORKS_WITH = "works_with"       # Currently work together
     COWORKER = "coworker"           # Alias for works_with
-    # Employment-based relationships (past)
+    COLLABORATOR = "collaborator"   # Working together on project
+    
+    # Employment-based (past)
     WORKED_WITH = "worked_with"     # Previously worked together
     FORMER_COWORKER = "former_coworker"  # Alias for worked_with
+    
     # Mentorship
-    MENTOR = "mentor"
-    MENTEE = "mentee"
-    # Other
-    ACQUAINTANCE = "acquaintance"
+    MENTOR = "mentor"               # Source mentors target
+    MENTEE = "mentee"               # Source is mentored by target
+    
+    # Professional contacts
     PROFESSIONAL = "professional"
+    INTRODUCED_BY = "introduced_by" # Was introduced through this person
+    
+    # Other
     OTHER = "other"
+
+
+class ProfessionalRelationshipType(str, Enum):
+    """Types of professional/business relationships."""
+    INVESTOR = "investor"           # Investment relationship
+    ADVISOR = "advisor"             # Advisory relationship
+    CLIENT = "client"               # Client relationship
+    VENDOR = "vendor"               # Vendor/supplier
+    COMPETITOR = "competitor"       # Competitive relationship
+    NEGOTIATING_WITH = "negotiating_with"  # In negotiations
+    CONTRACTED_WITH = "contracted_with"    # Under contract
 
 
 class StructuralRelationshipType(str, Enum):
     """Types of structural relationships between entities."""
+    # Hierarchy
     PART_OF = "part_of"
-    DEPENDS_ON = "depends_on"
-    BLOCKS = "blocks"
-    RELATED_TO = "related_to"
-    REFERENCES = "references"
     PARENT_OF = "parent_of"
     CHILD_OF = "child_of"
+    
+    # Dependencies
+    DEPENDS_ON = "depends_on"
+    BLOCKS = "blocks"
+    
+    # References
+    RELATED_TO = "related_to"
+    REFERENCES = "references"
     STAKEHOLDER_OF = "stakeholder_of"
+    
+    # Causal/Sequential
+    LEADS_TO = "leads_to"           # Causal or sequential
+    DERIVED_FROM = "derived_from"   # Evolved from
+    
     # Multi-day event relationships
     NEXT_DAY = "next_day"           # day 1 -> day 2 sequence for multi-day events
     PART_OF_EVENT = "part_of_event" # day event -> parent multi-day event
+    
     # Period relationships
     DURING = "during"               # event/entity occurred during a Period
 
 
 # Union type for all relationship types
-RelationshipType = PersonalRelationshipType | StructuralRelationshipType
+RelationshipType = PersonalRelationshipType | ProfessionalRelationshipType | StructuralRelationshipType
 
 
 class Source(str, Enum):
@@ -463,9 +500,14 @@ class Document(BaseEntity):
 # ============================================
 
 class Relationship(BaseModel):
-    """A relationship between two entities."""
+    """A relationship between two entities.
+    
+    Supports rich data and multiple relationships of the same type
+    between the same entities (for different contexts, time periods, etc.).
+    """
     
     id: UUID = Field(default_factory=uuid4)
+    """Unique relationship identifier."""
     
     source_id: UUID
     """Source entity UUID."""
@@ -474,23 +516,46 @@ class Relationship(BaseModel):
     """Target entity UUID."""
     
     category: RelationshipCategory
-    """Personal or structural."""
+    """Personal, professional, or structural."""
     
     relationship_type: str
-    """Specific relationship type (friend, depends_on, etc.)."""
+    """Specific relationship type (friend, works_with, depends_on, etc.)."""
     
+    # Rich data fields
     strength: float = Field(default=0.5, ge=0.0, le=1.0)
-    """Relationship strength (0.0-1.0)."""
+    """Relationship strength (0.0-1.0). Higher = stronger connection."""
     
     sentiment: float = Field(default=0.0, ge=-1.0, le=1.0)
-    """Emotional sentiment: -1.0 (negative) to +1.0 (positive)."""
+    """Emotional sentiment: -1.0 (negative/adversarial) to +1.0 (positive)."""
+    
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    """How confident we are in this relationship (0.0-1.0)."""
+    
+    # Context
+    context: str | None = None
+    """Why/how this relationship exists (e.g., 'met at conference', 'childhood friends')."""
+    
+    notes: str | None = None
+    """Additional notes about this relationship."""
+    
+    # Temporal bounds
+    started_at: date | None = None
+    """When the relationship started."""
+    
+    ended_at: date | None = None
+    """When the relationship ended (if applicable)."""
     
     last_interaction: datetime | None = None
     """Last interaction for this relationship."""
     
-    notes: str | None = None
-    """Notes about this relationship."""
+    # Source tracking
+    source: Source = Source.AGENT
+    """How this relationship was created."""
     
+    source_text: str | None = None
+    """The original text that led to this relationship."""
+    
+    # Timestamps
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 

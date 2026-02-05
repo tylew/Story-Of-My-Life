@@ -302,32 +302,73 @@ class GraphStore:
         relationship_type: str,
         category: RelationshipCategory | str,
         properties: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> str:
         """
         Create a relationship between two entities.
         
-        Uses :RELATES_TO as the base relationship with type as a property.
+        Always creates a new relationship with a unique ID. Multiple relationships
+        of the same type between the same entities are allowed (for different contexts,
+        time periods, projects, etc.).
+        
+        Uses :RELATES_TO as the base relationship with type and rich data as properties.
+        
+        Args:
+            source_id: Source entity UUID
+            target_id: Target entity UUID
+            relationship_type: Type of relationship (e.g., 'friend', 'works_with')
+            category: Personal or structural
+            properties: Rich relationship data including:
+                - id: Unique relationship ID (auto-generated if not provided)
+                - strength: 0.0-1.0 relationship strength
+                - sentiment: -1.0 to 1.0 emotional sentiment
+                - confidence: 0.0-1.0 confidence level
+                - context: Why/how this relationship exists
+                - notes: Additional notes
+                - started_at: When relationship started
+                - ended_at: When relationship ended
+                - source: How created ('user', 'agent', 'import')
+                - source_text: Original text that created this
+        
+        Returns:
+            The unique relationship ID
         """
+        from uuid import uuid4 as gen_uuid
+        
         cat_str = category.value if isinstance(category, RelationshipCategory) else category
         props = properties or {}
+        
+        # Core fields
         props["type"] = relationship_type
         props["category"] = cat_str
         props["created_at"] = datetime.now().isoformat()
+        props["updated_at"] = datetime.now().isoformat()
+        
+        # Ensure unique ID
+        if "id" not in props:
+            props["id"] = str(gen_uuid())
+        rel_id = props["id"]
+        
+        # Default rich data fields
+        props.setdefault("strength", 0.5)
+        props.setdefault("sentiment", 0.0)
+        props.setdefault("confidence", 0.8)
+        props.setdefault("source", "agent")
         
         with self.session() as session:
+            # Always CREATE (not MERGE) to allow multiple relationships
             session.run(
                 """
                 MATCH (source:Entity {id: $source_id})
                 MATCH (target:Entity {id: $target_id})
-                MERGE (source)-[r:RELATES_TO {type: $type}]->(target)
-                SET r += $props
+                CREATE (source)-[r:RELATES_TO]->(target)
+                SET r = $props
                 """,
                 source_id=str(source_id),
                 target_id=str(target_id),
-                type=relationship_type,
                 props=props,
             )
-            logger.debug(f"Created relationship {source_id} -[{relationship_type}]-> {target_id}")
+            logger.debug(f"Created relationship {source_id} -[{relationship_type}]-> {target_id} (id: {rel_id})")
+            return rel_id
     
     def get_relationships(self, entity_id: str | UUID, direction: str = "both") -> list[dict[str, Any]]:
         """

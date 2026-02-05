@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
-import { X, Link2, Calendar, Tag, User, Target, Zap, FileText, Edit3, Trash2, Clock, ExternalLink, ChevronRight, Plus, Lock, File, Timer, AlertCircle } from 'lucide-react'
+import { X, Link2, Calendar, Tag, User, Target, Zap, FileText, Edit3, Trash2, Clock, ExternalLink, ChevronRight, Plus, Lock, File, Timer, AlertCircle, ArrowRight, ArrowLeft, ArrowLeftRight } from 'lucide-react'
 import EntityEditor from './EntityEditor'
+import RelationshipDetail from './RelationshipDetail'
 
 const API_BASE = '/api'
 
@@ -22,7 +23,7 @@ const colorClasses = {
   orange: { bg: 'bg-amber-500/20', text: 'text-amber-500', border: 'border-amber-500/40' },
 }
 
-export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSelect }) {
+export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSelect, onRelationshipPairSelect }) {
   const [details, setDetails] = useState(null)
   const [documents, setDocuments] = useState([])
   const [loading, setLoading] = useState(true)
@@ -191,7 +192,23 @@ export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSel
               />
             )}
             {activeTab === 'relationships' && (
-              <RelationshipsTab details={details} colors={colors} />
+              <RelationshipsTab 
+                details={details} 
+                entity={entity}
+                onEntitySelect={(e) => {
+                  // Close current panel and select new entity
+                  onClose?.()
+                  setTimeout(() => {
+                    // Small delay to allow panel to close
+                    window.dispatchEvent(new CustomEvent('entity-select', { detail: e }))
+                  }, 50)
+                }}
+                onRefresh={() => {
+                  fetchDetails()
+                  onRefresh?.()
+                }}
+                onRelationshipPairSelect={onRelationshipPairSelect}
+              />
             )}
             {activeTab === 'activity' && (
               <ActivityTab details={details} colors={colors} />
@@ -446,8 +463,61 @@ function OverviewTab({ details, colors, entity }) {
   )
 }
 
-function RelationshipsTab({ details }) {
+function RelationshipsTab({ details, entity, onEntitySelect, onRefresh, onRelationshipPairSelect }) {
   const relationships = details?.relationships || []
+  const [selectedRel, setSelectedRel] = useState(null)
+  const [creating, setCreating] = useState(false)
+
+  const formatRelType = (type) => type?.replace(/_/g, ' ') || 'related to'
+
+  const handleSaveRelationship = async (updatedRel) => {
+    try {
+      const res = await fetch(`${API_BASE}/relationships/${updatedRel.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedRel),
+      })
+      if (res.ok) {
+        onRefresh?.()
+        setSelectedRel(null)
+      }
+    } catch (e) {
+      console.error('Failed to save relationship:', e)
+    }
+  }
+
+  const handleDeleteRelationship = async (relId) => {
+    try {
+      const res = await fetch(`${API_BASE}/relationships/${relId}`, {
+        method: 'DELETE',
+      })
+      if (res.ok) {
+        onRefresh?.()
+        setSelectedRel(null)
+      }
+    } catch (e) {
+      console.error('Failed to delete relationship:', e)
+    }
+  }
+
+  if (selectedRel) {
+    return (
+      <div className="p-4">
+        <RelationshipDetail
+          relationship={selectedRel}
+          sourceEntity={entity}
+          targetEntity={{ id: selectedRel.other_id, name: selectedRel.other_name, type: selectedRel.other_type }}
+          onClose={() => setSelectedRel(null)}
+          onSave={handleSaveRelationship}
+          onDelete={handleDeleteRelationship}
+          onEntitySelect={(e) => {
+            onEntitySelect?.(e)
+            setSelectedRel(null)
+          }}
+        />
+      </div>
+    )
+  }
 
   if (relationships.length === 0) {
     return (
@@ -464,24 +534,79 @@ function RelationshipsTab({ details }) {
   return (
     <div className="p-4 space-y-2">
       {relationships.map((rel, idx) => (
-        <button
-          key={idx}
-          className="w-full glass neon-border rounded-lg p-4 text-left hover:border-neon-purple/60 transition-all flex items-center gap-4"
+        <div
+          key={rel.id || idx}
+          className="glass neon-border rounded-lg p-4 hover:border-neon-purple/60 transition-all group"
         >
-          <div className="w-10 h-10 rounded-lg bg-slate-dark flex items-center justify-center">
-            <Link2 className="w-5 h-5 text-neon-purple" />
+          <div className="flex items-center gap-4">
+            <div className="w-10 h-10 rounded-lg bg-neon-purple/10 flex items-center justify-center">
+              {/* Direction icon */}
+              {rel.direction === 'incoming' ? (
+                <ArrowLeft className="w-5 h-5 text-neon-purple" />
+              ) : rel.direction === 'bidirectional' ? (
+                <ArrowLeftRight className="w-5 h-5 text-neon-purple" />
+              ) : (
+                <ArrowRight className="w-5 h-5 text-neon-purple" />
+              )}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <p className="font-medium truncate">{rel.other_name || 'Unknown'}</p>
+                <span className="px-2 py-0.5 rounded-full text-xs bg-neon-purple/20 text-neon-purple capitalize">
+                  {formatRelType(rel.type)}
+                </span>
+                {rel.direction && rel.direction !== 'outgoing' && (
+                  <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-dark text-slate-400">
+                    {rel.direction === 'incoming' ? '←' : '↔'}
+                  </span>
+                )}
+              </div>
+              {rel.context && (
+                <p className="text-xs text-slate-500 truncate mt-1">{rel.context}</p>
+              )}
+            </div>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setSelectedRel(rel)}
+                className="p-1.5 rounded-lg hover:bg-neon-purple/10 transition-colors"
+                title="Edit relationship"
+              >
+                <Edit3 className="w-4 h-4 text-slate-400 hover:text-neon-purple" />
+              </button>
+              {onRelationshipPairSelect && (
+                <button
+                  onClick={() => {
+                    // Construct the other entity to pass to the relationship pair view
+                    const otherEntity = {
+                      id: rel.other_id,
+                      name: rel.other_name,
+                      type: rel.other_type || 'unknown',
+                    }
+                    onRelationshipPairSelect(entity, otherEntity)
+                  }}
+                  className="p-1.5 rounded-lg hover:bg-neon-cyan/10 transition-colors"
+                  title="View all relationships between these entities"
+                >
+                  <Link2 className="w-4 h-4 text-slate-400 hover:text-neon-cyan" />
+                </button>
+              )}
+            </div>
           </div>
-          <div className="flex-1 min-w-0">
-            <p className="font-medium truncate">{rel.other_name || 'Unknown'}</p>
-            <p className="text-xs text-slate-500">{rel.type || 'related'}</p>
-          </div>
-          {rel.category && (
-            <span className="px-2 py-0.5 rounded-full text-xs bg-slate-dark text-slate-400">
-              {rel.category}
-            </span>
+          
+          {/* Context row */}
+          {(rel.context || rel.category) && (
+            <div className="flex items-center gap-2 mt-3 pt-3 border-t border-slate-700/50">
+              {rel.context && (
+                <span className="text-xs text-slate-400 truncate flex-1">{rel.context}</span>
+              )}
+              {rel.category && (
+                <span className="px-2 py-0.5 rounded-full text-xs bg-slate-dark text-slate-400">
+                  {rel.category}
+                </span>
+              )}
+            </div>
           )}
-          <ChevronRight className="w-4 h-4 text-slate-500" />
-        </button>
+        </div>
       ))}
     </div>
   )

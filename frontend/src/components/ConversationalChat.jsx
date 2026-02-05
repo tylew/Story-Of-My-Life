@@ -4,6 +4,8 @@ import {
   Plus, ChevronDown, ChevronUp, Users, Target, Zap, Calendar, 
   Link2, RefreshCw, MessageSquare, FileText, Clock, ExternalLink
 } from 'lucide-react'
+import ChangeSummary from './ChangeSummary'
+import RelationshipDetail from './RelationshipDetail'
 
 const API_BASE = '/api'
 
@@ -269,15 +271,9 @@ export default function ConversationalChat({
       const data = await res.json()
       
       // Build result message
-      const created = data.created_entities?.length || 0
-      const linked = data.linked_entities?.length || 0
-      const rels = data.relationships?.length || 0
       const errors = data.errors?.length || 0
       
       let resultMsg = data.message || "✅ Changes saved!"
-      if (errors > 0) {
-        resultMsg += `\n\n⚠️ ${errors} issues: ${data.errors.join(', ')}`
-      }
       
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
@@ -286,7 +282,10 @@ export default function ConversationalChat({
         timestamp: new Date().toISOString(),
         savedEntities: data.created_entities,
         linkedEntities: data.linked_entities,
-        savedRelationships: data.relationships,
+        savedRelationships: data.relationships_created || data.relationships || [],
+        updatedDocuments: data.documents_updated || [],
+        errors: data.errors || [],
+        hasChangeSummary: true,
       }])
       
       setPendingProposal(null)
@@ -539,8 +538,9 @@ export default function ConversationalChat({
   )
 }
 
-function MessageBubble({ message, fullPage = false, onEntitySelect }) {
+function MessageBubble({ message, fullPage = false, onEntitySelect, onRelationshipSelect }) {
   const isUser = message.role === 'user'
+  const [selectedRelationship, setSelectedRelationship] = useState(null)
   
   // Simple markdown formatting
   const formatContent = (text) => {
@@ -572,6 +572,11 @@ function MessageBubble({ message, fullPage = false, onEntitySelect }) {
     }
   }
   
+  const handleRelationshipClick = (rel) => {
+    // For now, open the source entity. Could add a relationship detail modal later.
+    setSelectedRelationship(rel)
+  }
+  
   return (
     <div className={`flex ${fullPage ? 'gap-4' : 'gap-3'} animate-fade-in ${isUser ? 'flex-row-reverse' : ''}`}>
       <div className={`
@@ -588,8 +593,21 @@ function MessageBubble({ message, fullPage = false, onEntitySelect }) {
           {formatContent(message.content)}
         </div>
         
-        {/* Saved entities indicator - clickable */}
-        {message.savedEntities && message.savedEntities.length > 0 && (
+        {/* New Change Summary Component - replaces old entity/relationship display */}
+        {message.hasChangeSummary && (
+          <ChangeSummary
+            createdEntities={message.savedEntities || []}
+            linkedEntities={message.linkedEntities || []}
+            createdRelationships={message.savedRelationships || []}
+            updatedDocuments={message.updatedDocuments || []}
+            errors={message.errors || []}
+            onEntitySelect={onEntitySelect}
+            onRelationshipSelect={handleRelationshipClick}
+          />
+        )}
+        
+        {/* Legacy: Saved entities indicator - clickable (for old messages without hasChangeSummary) */}
+        {!message.hasChangeSummary && message.savedEntities && message.savedEntities.length > 0 && (
           <div className="mt-3 pt-3 border-t border-slate-700">
             <p className="text-xs text-neon-green mb-2">✓ Created:</p>
             <div className="flex flex-wrap gap-1">
@@ -612,8 +630,8 @@ function MessageBubble({ message, fullPage = false, onEntitySelect }) {
           </div>
         )}
         
-        {/* Linked entities - clickable */}
-        {message.linkedEntities && message.linkedEntities.length > 0 && (
+        {/* Legacy: Linked entities - clickable */}
+        {!message.hasChangeSummary && message.linkedEntities && message.linkedEntities.length > 0 && (
           <div className="mt-3 pt-3 border-t border-slate-700">
             <p className="text-xs text-neon-blue mb-2">🔗 Linked:</p>
             <div className="flex flex-wrap gap-1">
@@ -667,6 +685,19 @@ function MessageBubble({ message, fullPage = false, onEntitySelect }) {
         <p className="text-[10px] text-slate-500 mt-2 font-mono">
           {new Date(message.timestamp).toLocaleTimeString()}
         </p>
+        
+        {/* Relationship detail modal */}
+        {selectedRelationship && (
+          <div className="mt-3 pt-3 border-t border-slate-700">
+            <RelationshipDetail
+              relationship={selectedRelationship}
+              sourceEntity={{ id: selectedRelationship.source_id, name: selectedRelationship.source_name }}
+              targetEntity={{ id: selectedRelationship.target_id, name: selectedRelationship.target_name }}
+              onClose={() => setSelectedRelationship(null)}
+              onEntitySelect={onEntitySelect}
+            />
+          </div>
+        )}
       </div>
     </div>
   )

@@ -21,6 +21,7 @@ from soml.mcp.tools.entity import (
 )
 from soml.mcp.tools.employment import set_employment
 from soml.mcp.tools.relationship import link_entities
+from soml.mcp.resolution import EntityResolver
 
 
 def _extract_employment_from_context(context: str | None) -> tuple[str | None, str | None]:
@@ -50,6 +51,54 @@ def _extract_employment_from_context(context: str | None) -> tuple[str | None, s
                 return org, None
     
     return None, None
+
+
+def _resolve_entity_by_name(resolver: EntityResolver, name: str) -> str | None:
+    """
+    Resolve an entity name to an existing entity ID by searching the registry.
+    
+    Searches across all entity types to find the best match.
+    
+    Args:
+        resolver: EntityResolver instance
+        name: Name to resolve
+    
+    Returns:
+        Entity ID if found, None otherwise
+    """
+    from soml.core.types import EntityType
+    
+    # Try each entity type
+    for entity_type in [EntityType.PERSON, EntityType.PROJECT, EntityType.PERIOD, EntityType.EVENT, EntityType.GOAL]:
+        result = resolver.resolve(name=name, entity_type=entity_type)
+        if result.found and result.entity_id:
+            return result.entity_id
+    
+    # Also try fuzzy matching across all types via registry search
+    from soml.storage.registry import RegistryStore
+    registry = RegistryStore()
+    
+    # Search by name
+    matches = registry.search(name, limit=5)
+    if matches:
+        # Check for high-confidence match (exact or near-exact name match)
+        for match in matches:
+            match_name = match.get("name", "").lower()
+            search_name = name.lower()
+            
+            # Exact match
+            if match_name == search_name:
+                return match.get("id")
+            
+            # Check if one contains the other (e.g., "Hansji" matches "Hansji Corporation")
+            if search_name in match_name or match_name in search_name:
+                # Calculate similarity
+                shorter = min(len(match_name), len(search_name))
+                longer = max(len(match_name), len(search_name))
+                if shorter / longer > 0.5:  # At least 50% overlap
+                    return match.get("id")
+    
+    return None
 
 
 def _is_organization_entity(name: str, entity_type: str, context: str | None, all_entities: list[dict]) -> bool:
@@ -190,13 +239,20 @@ def process_extraction(
                         source_id=p1_id,
                         target_id=p2_id,
                         rel_type="works_with",
-                        properties={"context": f"Both work at {org}"},
+                        properties={
+                            "context": f"Both work at {org}",
+                            "source": "agent",
+                            "confidence": 0.9,  # High confidence since we have explicit employment data
+                        },
                     )
                     if link_result.action != "failed":
                         result.relationships.append(link_result)
                         logger.info(f"Created works_with relationship at {org}")
     
     # Process explicit relationships
+    # Use entity resolver to find existing entities that may not be in the current batch
+    resolver = EntityResolver()
+    
     for rel_data in relationships:
         source_name = rel_data.get("source_name", "")
         target_name = rel_data.get("target_name", "")
@@ -207,23 +263,59 @@ def process_extraction(
             logger.info(f"Skipping works_at relationship - employment set on person")
             continue
         
+        # Try to get IDs from current batch first
         source_id = entity_id_map.get(source_name)
         target_id = entity_id_map.get(target_name)
         
+        # If not in current batch, search the registry for existing entities
+        if not source_id:
+            source_id = _resolve_entity_by_name(resolver, source_name)
+            if source_id:
+                logger.info(f"Resolved source '{source_name}' to existing entity: {source_id}")
+        
+        if not target_id:
+            target_id = _resolve_entity_by_name(resolver, target_name)
+            if target_id:
+                logger.info(f"Resolved target '{target_name}' to existing entity: {target_id}")
+        
         if not source_id or not target_id:
+            missing = []
+            if not source_id:
+                missing.append(source_name)
+            if not target_id:
+                missing.append(target_name)
             result.relationships.append(LinkResult(
                 action="failed",
-                error=f"Missing entity ID for {source_name if not source_id else target_name}",
+                error=f"Could not resolve entity: {', '.join(missing)}",
             ))
             continue
+        
+        # Build rich relationship properties
+        rel_properties = {
+            "notes": rel_data.get("reason"),
+            "context": rel_data.get("context"),
+            "source_text": rel_data.get("source_text"),
+            "source": "agent",
+        }
+        
+        # Include optional rich data if provided
+        if rel_data.get("strength"):
+            rel_properties["strength"] = rel_data.get("strength")
+        if rel_data.get("sentiment"):
+            rel_properties["sentiment"] = rel_data.get("sentiment")
+        if rel_data.get("confidence"):
+            rel_properties["confidence"] = rel_data.get("confidence")
+        if rel_data.get("started_at"):
+            rel_properties["started_at"] = rel_data.get("started_at")
+        
+        # Remove None values
+        rel_properties = {k: v for k, v in rel_properties.items() if v is not None}
         
         link_result = link_entities(
             source_id=source_id,
             target_id=target_id,
             rel_type=rel_type,
-            properties={
-                "notes": rel_data.get("reason"),
-            },
+            properties=rel_properties,
         )
         result.relationships.append(link_result)
     
@@ -244,5 +336,6 @@ __all__ = [
     "process_extraction",
     "_extract_employment_from_context",
     "_is_organization_entity",
+    "_resolve_entity_by_name",
 ]
 
