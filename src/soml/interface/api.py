@@ -23,6 +23,7 @@ from soml.core.config import Settings, get_logger
 from soml.core.types import EntityType, DocumentType, Document, Period, Source
 from soml.crew.crew import SOMLCrew, get_crew
 from soml.storage.conversations import ConversationStore
+from soml.storage.audit import AuditLog
 
 logger = get_logger("api")
 from soml.storage.graph import GraphStore
@@ -51,6 +52,7 @@ graph_store = GraphStore(settings.neo4j_uri, settings.neo4j_user, settings.neo4j
 registry = RegistryStore()
 md_store = MarkdownStore()
 conv_store = ConversationStore()
+audit = AuditLog(registry)
 
 
 @app.on_event("startup")
@@ -247,6 +249,19 @@ async def get_graph() -> GraphData:
     nodes = []
     edges = []
     
+    # Build a map of relationship counts per entity from Neo4j
+    rel_counts = {}
+    try:
+        with graph_store.session() as session:
+            count_result = session.run("""
+                MATCH (e:Entity)-[r:RELATES_TO]-(other:Entity)
+                RETURN e.id AS id, count(DISTINCT other) AS total_rels
+            """)
+            for record in count_result:
+                rel_counts[record["id"]] = record["total_rels"]
+    except Exception:
+        pass
+    
     # Get all entities from registry
     entity_types = [
         EntityType.PERSON,
@@ -259,11 +274,13 @@ async def get_graph() -> GraphData:
     for entity_type in entity_types:
         docs = registry.list_by_type(entity_type)
         for doc in docs:
+            eid = doc.get("id")
             nodes.append({
-                "id": doc.get("id"),
+                "id": eid,
                 "label": doc.get("name") or doc.get("title", "Unknown"),
                 "type": doc.get("type"),
                 "group": doc.get("type"),
+                "total_relationships": rel_counts.get(eid, 0),
             })
     
     # Get relationships from Neo4j
@@ -282,6 +299,122 @@ async def get_graph() -> GraphData:
                 })
     except Exception as e:
         print(f"Error fetching relationships: {e}")
+    
+    return GraphData(nodes=nodes, edges=edges)
+
+
+@app.get("/graph/ego/{node_id}")
+async def get_ego_graph(node_id: str, depth: int = 1):
+    """Get ego-graph: a subgraph centered on node_id with `depth` hops.
+    
+    Returns nodes within N hops, edges between them, and for each node
+    its total_relationships count so the UI can show hidden-connection indicators.
+    """
+    if depth < 1:
+        depth = 1
+    if depth > 5:
+        depth = 5
+    
+    nodes = []
+    edges = []
+    node_ids = set()
+    
+    try:
+        with graph_store.session() as session:
+            # Get all nodes within N hops of the center node
+            result = session.run("""
+                MATCH path = (center:Entity {id: $center_id})-[:RELATES_TO*1..%d]-(neighbor:Entity)
+                WITH collect(DISTINCT neighbor) + collect(DISTINCT center) AS all_nodes
+                UNWIND all_nodes AS n
+                WITH DISTINCT n
+                OPTIONAL MATCH (n)-[r:RELATES_TO]-(other:Entity)
+                WITH n, count(DISTINCT other) AS total_rels
+                RETURN n.id AS id, n.name AS name, labels(n) AS labels, total_rels
+            """ % depth, center_id=node_id)
+            
+            for record in result:
+                nid = record["id"]
+                if nid and nid not in node_ids:
+                    node_ids.add(nid)
+                    # Determine entity type from labels
+                    labels = record["labels"] or []
+                    entity_type = "note"
+                    for lbl in labels:
+                        low = lbl.lower()
+                        if low in ("person", "project", "goal", "event", "period"):
+                            entity_type = low
+                            break
+                    nodes.append({
+                        "id": nid,
+                        "label": record["name"] or "Unknown",
+                        "type": entity_type,
+                        "group": entity_type,
+                        "total_relationships": record["total_rels"] or 0,
+                    })
+            
+            # If center node wasn't found via paths (it has no relationships), add it directly
+            if node_id not in node_ids:
+                center_result = session.run("""
+                    MATCH (n:Entity {id: $id})
+                    OPTIONAL MATCH (n)-[r:RELATES_TO]-(other:Entity)
+                    WITH n, count(DISTINCT other) AS total_rels
+                    RETURN n.id AS id, n.name AS name, labels(n) AS labels, total_rels
+                """, id=node_id)
+                rec = center_result.single()
+                if rec:
+                    labels = rec["labels"] or []
+                    entity_type = "note"
+                    for lbl in labels:
+                        low = lbl.lower()
+                        if low in ("person", "project", "goal", "event", "period"):
+                            entity_type = low
+                            break
+                    nodes.append({
+                        "id": rec["id"],
+                        "label": rec["name"] or "Unknown",
+                        "type": entity_type,
+                        "group": entity_type,
+                        "total_relationships": rec["total_rels"] or 0,
+                    })
+                    node_ids.add(node_id)
+                else:
+                    # Node not in graph, try registry
+                    registry_doc = registry.get(node_id)
+                    if registry_doc:
+                        nodes.append({
+                            "id": node_id,
+                            "label": registry_doc.get("name") or registry_doc.get("title", "Unknown"),
+                            "type": registry_doc.get("type", "note"),
+                            "group": registry_doc.get("type", "note"),
+                            "total_relationships": 0,
+                        })
+                        node_ids.add(node_id)
+            
+            # Get edges between visible nodes only
+            if node_ids:
+                edge_result = session.run("""
+                    MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+                    WHERE a.id IN $ids AND b.id IN $ids
+                    RETURN a.id AS source, b.id AS target, r.type AS type
+                """, ids=list(node_ids))
+                for record in edge_result:
+                    edges.append({
+                        "source": record["source"],
+                        "target": record["target"],
+                        "type": record["type"] or "related",
+                    })
+    except Exception as e:
+        print(f"Error fetching ego graph: {e}")
+        # Fallback: try to get at least the center node from registry
+        registry_doc = registry.get(node_id)
+        if registry_doc:
+            nodes.append({
+                "id": node_id,
+                "label": registry_doc.get("name") or registry_doc.get("title", "Unknown"),
+                "type": registry_doc.get("type", "note"),
+                "group": registry_doc.get("type", "note"),
+                "total_relationships": 0,
+            })
     
     return GraphData(nodes=nodes, edges=edges)
 
@@ -321,12 +454,36 @@ async def get_node(node_id: str):
 # Entity Endpoints
 # ==========================================
 
+def _get_relationship_counts() -> dict[str, int]:
+    """Get relationship counts per entity from Neo4j."""
+    rel_counts: dict[str, int] = {}
+    try:
+        with graph_store.session() as session:
+            result = session.run("""
+                MATCH (e:Entity)-[r:RELATES_TO]-(other:Entity)
+                RETURN e.id AS id, count(DISTINCT other) AS total_rels
+            """)
+            for record in result:
+                rel_counts[record["id"]] = record["total_rels"]
+    except Exception:
+        pass
+    return rel_counts
+
+
+def _enrich_entities(docs: list[dict]) -> list[dict]:
+    """Enrich entity docs with relationship counts."""
+    rel_counts = _get_relationship_counts()
+    for doc in docs:
+        doc["total_relationships"] = rel_counts.get(doc.get("id", ""), 0)
+    return docs
+
+
 @app.get("/entities/{entity_type}")
 async def list_entities(entity_type: str):
     """List all entities of a given type."""
     try:
         docs = registry.list_by_type(entity_type)
-        return {"entities": docs, "count": len(docs)}
+        return {"entities": _enrich_entities(docs), "count": len(docs)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -335,35 +492,35 @@ async def list_entities(entity_type: str):
 async def list_people():
     """List all people."""
     docs = registry.list_by_type(EntityType.PERSON)
-    return {"people": docs, "count": len(docs)}
+    return {"people": _enrich_entities(docs), "count": len(docs)}
 
 
 @app.get("/projects")
 async def list_projects():
     """List all projects."""
     docs = registry.list_by_type(EntityType.PROJECT)
-    return {"projects": docs, "count": len(docs)}
+    return {"projects": _enrich_entities(docs), "count": len(docs)}
 
 
 @app.get("/goals")
 async def list_goals():
     """List all goals."""
     docs = registry.list_by_type(EntityType.GOAL)
-    return {"goals": docs, "count": len(docs)}
+    return {"goals": _enrich_entities(docs), "count": len(docs)}
 
 
 @app.get("/events")
 async def list_events():
     """List all events."""
     docs = registry.list_by_type(EntityType.EVENT)
-    return {"events": docs, "count": len(docs)}
+    return {"events": _enrich_entities(docs), "count": len(docs)}
 
 
 @app.get("/notes")
 async def list_notes():
     """List all notes."""
     docs = registry.list_by_type(EntityType.NOTE)
-    return {"notes": docs, "count": len(docs)}
+    return {"notes": _enrich_entities(docs), "count": len(docs)}
 
 
 @app.get("/entities/detail/{entity_id}")
@@ -495,6 +652,17 @@ async def update_entity(entity_id: str, updates: UpdateEntityRequest):
         # Update in Neo4j
         graph_store.update_node(entity_id, update_dict)
         
+        # Audit log: capture before/after state
+        entity_name = metadata.get("name") or metadata.get("title", "Unknown")
+        audit.log_update(
+            document_id=entity_id,
+            old_data={"metadata": {k: md_doc.get("metadata", {}).get(k) for k in update_dict.keys()}},
+            new_data={"metadata": update_dict},
+            actor="user",
+            item_type="entity",
+            item_name=entity_name,
+        )
+        
         logger.info(f"Updated entity {entity_id}")
         
         return {
@@ -520,11 +688,13 @@ async def delete_entity(entity_id: str, hard_delete: bool = False):
         entity_id: The entity ID to delete
         hard_delete: If True, permanently delete. If False (default), soft delete.
     
-    Deletes:
-    - The entity's markdown file
-    - The entity from the registry (SQLite)
-    - The entity from the graph store (Neo4j)
-    - Associated documents (General Info, etc.)
+    Soft delete:
+    - Markdown files moved to .deleted/ folder (recoverable)
+    - Registry and graph entries removed
+    - Full state captured in audit log for undo
+    
+    Hard delete:
+    - Permanent removal from all stores
     """
     try:
         # Get existing entity
@@ -535,24 +705,58 @@ async def delete_entity(entity_id: str, hard_delete: bool = False):
         entity_type = entity.get("type")
         entity_name = entity.get("name") or entity.get("title", "Unknown")
         
-        # Get the markdown file path
+        # Capture full entity state for audit log (enables undo)
         md_doc = md_store.read_by_id(entity_id, entity_type)
         filepath = md_doc.get("path") if md_doc else None
         
+        entity_snapshot = {
+            "registry": entity,
+            "metadata": md_doc.get("metadata", {}) if md_doc else {},
+            "content": md_doc.get("content", "") if md_doc else "",
+            "filepath": str(filepath) if filepath else None,
+        }
+        
         # Delete associated documents (General Info, etc.)
         docs = registry.list_entity_documents(entity_id)
+        doc_snapshots = []
         for doc in docs:
             try:
                 doc_md = md_store.read_document(doc["id"])
+                doc_snapshot = {
+                    "registry": doc,
+                    "content": doc_md.get("content", "") if doc_md else "",
+                    "metadata": doc_md.get("metadata", {}) if doc_md else {},
+                    "filepath": str(doc_md.get("path", "")) if doc_md else "",
+                }
+                doc_snapshots.append(doc_snapshot)
+                
                 if doc_md and doc_md.get("path"):
-                    import os
-                    os.remove(doc_md["path"])
+                    from pathlib import Path as PathObj
+                    md_store.delete(PathObj(doc_md["path"]), soft=not hard_delete)
+                
+                # Delete document from Neo4j graph
+                try:
+                    graph_store.delete_document_node(doc["id"])
+                except Exception:
+                    pass
+                
                 registry.delete(doc["id"])
+                
+                # Audit each document deletion
+                audit.log_delete(
+                    document_id=doc["id"],
+                    data=doc_snapshot,
+                    soft=not hard_delete,
+                    actor="user",
+                    item_type="document",
+                    item_name=doc.get("name", "Document"),
+                )
+                
                 logger.info(f"Deleted associated document {doc['id']}")
             except Exception as doc_err:
                 logger.warning(f"Failed to delete document {doc.get('id')}: {doc_err}")
         
-        # Delete from graph store
+        # Delete from graph store (entity node + all relationships)
         try:
             graph_store.delete_node(entity_id)
             logger.info(f"Deleted entity from graph: {entity_id}")
@@ -563,14 +767,25 @@ async def delete_entity(entity_id: str, hard_delete: bool = False):
         registry.delete(entity_id)
         logger.info(f"Deleted entity from registry: {entity_id}")
         
-        # Delete markdown file
+        # Delete/soft-delete markdown file
         if filepath:
-            import os
+            from pathlib import Path as PathObj
             try:
-                os.remove(filepath)
-                logger.info(f"Deleted markdown file: {filepath}")
+                md_store.delete(PathObj(filepath), soft=not hard_delete)
+                logger.info(f"{'Soft' if not hard_delete else 'Hard'} deleted markdown file: {filepath}")
             except Exception as file_err:
                 logger.warning(f"Failed to delete file {filepath}: {file_err}")
+        
+        # Audit log: capture full entity state for undo
+        entity_snapshot["documents"] = doc_snapshots
+        audit.log_delete(
+            document_id=entity_id,
+            data=entity_snapshot,
+            soft=not hard_delete,
+            actor="user",
+            item_type="entity",
+            item_name=entity_name,
+        )
         
         logger.info(f"Deleted {entity_type}: {entity_name} ({entity_id})")
         
@@ -579,6 +794,7 @@ async def delete_entity(entity_id: str, hard_delete: bool = False):
             "message": f"Deleted {entity_type} '{entity_name}' successfully",
             "entity_id": entity_id,
             "entity_type": entity_type,
+            "soft_delete": not hard_delete,
         }
         
     except HTTPException:
@@ -730,6 +946,24 @@ async def create_relationship(request: CreateRelationshipRequest):
             )
         
         if result.action == "created":
+            # Audit log
+            source_entity = registry.get(request.source_id)
+            target_entity = registry.get(request.target_id)
+            source_name = (source_entity.get("name") or source_entity.get("title", "Unknown")) if source_entity else "Unknown"
+            target_name = (target_entity.get("name") or target_entity.get("title", "Unknown")) if target_entity else "Unknown"
+            audit.log_create(
+                document_id=result.relationship_id or "unknown",
+                data={
+                    "source_id": request.source_id,
+                    "target_id": request.target_id,
+                    "type": request.relationship_type,
+                    "direction": request.direction,
+                },
+                actor="user",
+                item_type="relationship",
+                item_name=f"{source_name} → {target_name} ({request.relationship_type})",
+            )
+            
             return {
                 "success": True,
                 "action": "created",
@@ -762,6 +996,22 @@ async def update_relationship(relationship_id: str, request: UpdateRelationshipR
         if not updates:
             return {"success": True, "message": "No updates provided"}
         
+        # Capture before-state
+        old_data = {}
+        with graph_store.session() as session:
+            old_result = session.run("""
+                MATCH (source:Entity)-[r:RELATES_TO {id: $rel_id}]->(target:Entity)
+                RETURN properties(r) as props, source.name as source_name, target.name as target_name
+            """, rel_id=relationship_id)
+            old_record = old_result.single()
+            if old_record:
+                old_data = dict(old_record["props"]) if old_record["props"] else {}
+                source_name = old_record["source_name"] or "Unknown"
+                target_name = old_record["target_name"] or "Unknown"
+            else:
+                source_name = "Unknown"
+                target_name = "Unknown"
+        
         # Add updated_at timestamp
         updates["updated_at"] = datetime.now().isoformat()
         
@@ -776,6 +1026,17 @@ async def update_relationship(relationship_id: str, request: UpdateRelationshipR
             record = result.single()
             if not record:
                 raise HTTPException(status_code=404, detail="Relationship not found")
+        
+        # Audit log
+        rel_type = updates.get("type") or old_data.get("type", "relationship")
+        audit.log_update(
+            document_id=relationship_id,
+            old_data={k: old_data.get(k) for k in updates.keys() if k != "updated_at"},
+            new_data=updates,
+            actor="user",
+            item_type="relationship",
+            item_name=f"{source_name} → {target_name} ({rel_type})",
+        )
         
         return {
             "success": True,
@@ -794,6 +1055,26 @@ async def update_relationship(relationship_id: str, request: UpdateRelationshipR
 async def delete_relationship_endpoint(relationship_id: str):
     """Delete a relationship by ID."""
     try:
+        # Capture before-state for audit
+        rel_snapshot = {}
+        source_name = "Unknown"
+        target_name = "Unknown"
+        with graph_store.session() as session:
+            old_result = session.run("""
+                MATCH (source:Entity)-[r:RELATES_TO {id: $rel_id}]->(target:Entity)
+                RETURN properties(r) as props, source.id as source_id, source.name as source_name,
+                       target.id as target_id, target.name as target_name
+            """, rel_id=relationship_id)
+            old_record = old_result.single()
+            if old_record:
+                rel_snapshot = {
+                    "properties": dict(old_record["props"]) if old_record["props"] else {},
+                    "source_id": old_record["source_id"],
+                    "target_id": old_record["target_id"],
+                }
+                source_name = old_record["source_name"] or "Unknown"
+                target_name = old_record["target_name"] or "Unknown"
+        
         with graph_store.session() as session:
             # Delete the relationship
             result = session.run("""
@@ -805,6 +1086,17 @@ async def delete_relationship_endpoint(relationship_id: str):
             record = result.single()
             if not record or record["deleted"] == 0:
                 raise HTTPException(status_code=404, detail="Relationship not found")
+        
+        # Audit log
+        rel_type = rel_snapshot.get("properties", {}).get("type", "relationship")
+        audit.log_delete(
+            document_id=relationship_id,
+            data=rel_snapshot,
+            soft=False,  # Neo4j relationships can't be soft-deleted
+            actor="user",
+            item_type="relationship",
+            item_name=f"{source_name} → {target_name} ({rel_type})",
+        )
         
         logger.info(f"Deleted relationship {relationship_id}")
         
@@ -820,6 +1112,54 @@ async def delete_relationship_endpoint(relationship_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/relationships/{relationship_id}/documents")
+async def list_relationship_documents(relationship_id: str):
+    """List all documents attached to a relationship."""
+    try:
+        docs = registry.list_relationship_documents(relationship_id)
+        return {
+            "documents": docs,
+            "count": len(docs),
+            "relationship_id": relationship_id,
+        }
+    except Exception as e:
+        logger.error(f"Error listing relationship documents: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CreateRelationshipDocumentRequest(BaseModel):
+    """Request body for creating a relationship document."""
+    title: str
+    content: str
+    tags: list[str] | None = None
+    document_type: str = "note"
+
+
+@app.post("/relationships/{relationship_id}/documents")
+async def create_relationship_document(relationship_id: str, request: CreateRelationshipDocumentRequest):
+    """Create a document attached to a relationship."""
+    from soml.mcp.tools.document import create_document
+    
+    try:
+        result = create_document(
+            title=request.title,
+            content=request.content,
+            parent_relationship_id=relationship_id,
+            tags=request.tags,
+            document_type=request.document_type,
+        )
+        
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail=result.get("error", "Failed to create document"))
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating relationship document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==========================================
 # Period Endpoints
 # ==========================================
@@ -828,7 +1168,7 @@ async def delete_relationship_endpoint(relationship_id: str):
 async def list_periods():
     """List all periods."""
     docs = registry.list_by_type(EntityType.PERIOD)
-    return {"periods": docs, "count": len(docs)}
+    return {"periods": _enrich_entities(docs), "count": len(docs)}
 
 
 @app.get("/periods/incomplete")
@@ -890,14 +1230,146 @@ async def get_period(period_id: str):
 # ==========================================
 
 @app.get("/documents")
-async def list_documents():
-    """List all documents in the system."""
+async def list_documents(
+    entity_id: str | None = None,
+    relationship_id: str | None = None,
+    entity_type: str | None = None,
+    tags: str | None = None,  # comma-separated
+    search: str | None = None,
+    limit: int = 100,
+):
+    """
+    List documents with optional filters.
+    
+    - entity_id: Filter by parent entity
+    - relationship_id: Filter by parent relationship
+    - entity_type: Filter by parent entity type (person, project, etc.)
+    - tags: Comma-separated list of tags to filter by (documents must have all tags)
+    - search: Full-text search in document content
+    - limit: Max number of results
+    """
     try:
-        docs = registry.list_all_documents()
+        # Start with all documents
+        if search:
+            docs = registry.search_documents(search, limit=limit)
+        elif entity_id:
+            docs = registry.list_entity_documents(entity_id)
+        elif relationship_id:
+            docs = registry.list_relationship_documents(relationship_id)
+        else:
+            docs = registry.list_all_documents()
+        
+        # Filter by entity_type if specified
+        if entity_type:
+            docs = [d for d in docs if d.get("parent_entity_type") == entity_type]
+        
+        # Filter by tags if specified
+        if tags:
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+            if tag_list:
+                # Get documents that have all specified tags
+                tag_doc_ids = set()
+                for tag_name in tag_list:
+                    tag_items = graph_store.find_by_tag(tag_name)
+                    tag_docs = {item["id"] for item in tag_items if item.get("type") == "Document"}
+                    if not tag_doc_ids:
+                        tag_doc_ids = tag_docs
+                    else:
+                        tag_doc_ids = tag_doc_ids.intersection(tag_docs)
+                docs = [d for d in docs if d.get("id") in tag_doc_ids]
+        
+        # Apply limit
+        docs = docs[:limit]
+        
         return {"documents": docs, "count": len(docs)}
     except Exception as e:
         logger.error(f"Error listing documents: {e}")
         return {"documents": [], "count": 0, "error": str(e)}
+
+
+@app.get("/documents/summary")
+async def get_documents_summary():
+    """
+    Get document counts grouped by entity type, entity, relationship, and tags.
+    Used for building the document browser sidebar tree.
+    """
+    try:
+        all_docs = registry.list_all_documents()
+        
+        # Group by entity type
+        by_entity_type: dict[str, int] = {}
+        by_entity: dict[str, dict] = {}
+        by_relationship: dict[str, int] = {}
+        orphan_count = 0
+        
+        for doc in all_docs:
+            entity_type = doc.get("parent_entity_type")
+            entity_id = doc.get("parent_entity_id")
+            rel_id = doc.get("parent_relationship_id")
+            
+            if rel_id:
+                by_relationship[rel_id] = by_relationship.get(rel_id, 0) + 1
+            elif entity_id and entity_type:
+                by_entity_type[entity_type] = by_entity_type.get(entity_type, 0) + 1
+                if entity_id not in by_entity:
+                    by_entity[entity_id] = {
+                        "id": entity_id,
+                        "type": entity_type,
+                        "name": doc.get("name", "Unknown"),
+                        "count": 0,
+                    }
+                by_entity[entity_id]["count"] += 1
+            else:
+                orphan_count += 1
+        
+        # Get entity names from registry
+        for entity_id in by_entity:
+            entity_doc = registry.get(entity_id)
+            if entity_doc:
+                by_entity[entity_id]["name"] = entity_doc.get("name", "Unknown")
+        
+        # Group by tags
+        by_tag: dict[str, int] = {}
+        all_tags = registry.get_all_tags()
+        for tag in all_tags:
+            tag_items = graph_store.find_by_tag(tag["name"])
+            doc_count = sum(1 for item in tag_items if item.get("type") == "Document")
+            if doc_count > 0:
+                by_tag[tag["name"]] = doc_count
+        
+        # Get relationships with documents
+        relationships_with_docs = []
+        for rel_id, count in by_relationship.items():
+            with graph_store.session() as session:
+                result = session.run("""
+                    MATCH (source:Entity)-[r:RELATES_TO {id: $rel_id}]->(target:Entity)
+                    RETURN source.id as source_id, source.label as source_name,
+                           target.id as target_id, target.label as target_name,
+                           r.type as type
+                """, rel_id=rel_id)
+                record = result.single()
+                if record:
+                    relationships_with_docs.append({
+                        "id": rel_id,
+                        "source_id": record["source_id"],
+                        "source_name": record["source_name"],
+                        "target_id": record["target_id"],
+                        "target_name": record["target_name"],
+                        "type": record["type"],
+                        "document_count": count,
+                    })
+        
+        return {
+            "total_count": len(all_docs),
+            "by_entity_type": by_entity_type,
+            "by_entity": list(by_entity.values()),
+            "by_relationship": relationships_with_docs,
+            "by_tag": by_tag,
+            "orphan_count": orphan_count,
+        }
+    except Exception as e:
+        logger.error(f"Error getting documents summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/documents/{doc_id}")
@@ -956,6 +1428,15 @@ async def create_document(request: CreateDocumentRequest):
             locked=doc.locked,
         )
         
+        # Audit log
+        audit.log_create(
+            document_id=str(doc.id),
+            data={"title": doc.title, "document_type": doc.document_type, "content": doc.content[:500]},
+            actor="user",
+            item_type="document",
+            item_name=doc.title,
+        )
+        
         return {
             "success": True,
             "document": {
@@ -982,6 +1463,14 @@ async def update_document(doc_id: str, request: UpdateDocumentRequest):
         raise HTTPException(status_code=403, detail="Cannot edit locked document (General Info)")
     
     try:
+        # Capture before-state for audit (full content snapshot)
+        old_md_doc = md_store.read_document(doc_id)
+        old_snapshot = {
+            "title": doc.get("name"),
+            "content": old_md_doc.get("content", "") if old_md_doc else "",
+            "metadata": old_md_doc.get("metadata", {}) if old_md_doc else {},
+        }
+        
         success = md_store.update_document(
             doc_id=doc_id,
             content=request.content,
@@ -1006,6 +1495,20 @@ async def update_document(doc_id: str, request: UpdateDocumentRequest):
                     locked=doc.get("locked", 0) == 1,
                 )
             
+            # Audit log: capture before/after content for rollback
+            new_snapshot = {
+                "title": request.title or doc.get("name"),
+                "content": md_doc.get("content", "") if md_doc else "",
+            }
+            audit.log_update(
+                document_id=doc_id,
+                old_data=old_snapshot,
+                new_data=new_snapshot,
+                actor="user",
+                item_type="document",
+                item_name=request.title or doc.get("name"),
+            )
+            
             return {"success": True, "message": "Document updated"}
         else:
             raise HTTPException(status_code=500, detail="Failed to update document")
@@ -1025,6 +1528,10 @@ async def append_to_document(doc_id: str, request: AppendDocumentRequest):
         raise HTTPException(status_code=404, detail="Document not found")
     
     try:
+        # Capture before-state for audit
+        old_md_doc = md_store.read_document(doc_id)
+        old_content = old_md_doc.get("content", "") if old_md_doc else ""
+        
         success = md_store.append_to_document(
             doc_id=doc_id,
             content=request.content,
@@ -1049,6 +1556,16 @@ async def append_to_document(doc_id: str, request: AppendDocumentRequest):
                     locked=doc.get("locked", 0) == 1,
                 )
             
+            # Audit log
+            audit.log_update(
+                document_id=doc_id,
+                old_data={"content": old_content},
+                new_data={"content": md_doc.get("content", "") if md_doc else "", "appended": request.content},
+                actor="agent",
+                item_type="document",
+                item_name=doc.get("name"),
+            )
+            
             return {"success": True, "message": "Content appended"}
         else:
             raise HTTPException(status_code=500, detail="Failed to append to document")
@@ -1069,18 +1586,40 @@ async def delete_document(doc_id: str, hard: bool = False):
         raise HTTPException(status_code=403, detail="Cannot delete locked document (General Info)")
     
     try:
-        # Get the file path
+        # Capture full state for audit (enables undo/restore)
         md_doc = md_store.read_document(doc_id)
+        doc_snapshot = {
+            "registry": doc,
+            "content": md_doc.get("content", "") if md_doc else "",
+            "metadata": md_doc.get("metadata", {}) if md_doc else {},
+            "filepath": str(md_doc.get("path", "")) if md_doc else "",
+        }
+        
+        # Delete markdown file (soft or hard)
         if md_doc and md_doc.get("path"):
-            md_store.delete(md_doc["path"], soft=not hard)
+            from pathlib import Path as PathObj
+            md_store.delete(PathObj(md_doc["path"]), soft=not hard)
+        
+        # Delete from Neo4j graph (removes vector embedding + edges)
+        try:
+            graph_store.delete_document_node(doc_id)
+        except Exception as graph_err:
+            logger.warning(f"Failed to delete document from graph: {graph_err}")
         
         # Remove from registry
         registry.delete(doc_id)
         
-        # Log audit
-        registry.log_audit(doc_id, "delete" if hard else "soft_delete")
+        # Audit log with full snapshot
+        audit.log_delete(
+            document_id=doc_id,
+            data=doc_snapshot,
+            soft=not hard,
+            actor="user",
+            item_type="document",
+            item_name=doc.get("name", "Document"),
+        )
         
-        return {"success": True, "message": "Document deleted"}
+        return {"success": True, "message": "Document deleted", "soft_delete": not hard}
         
     except Exception as e:
         logger.error(f"Error deleting document: {e}")
@@ -1545,6 +2084,712 @@ async def get_open_loops():
     except Exception as e:
         logger.error(f"Open loops error: {e}")
         return {"loops": [], "count": 0, "error": str(e)}
+
+
+# ==========================================
+# Folders
+# ==========================================
+
+class CreateFolderRequest(BaseModel):
+    name: str
+    parent_path: str = "/"
+    entity_id: str | None = None
+
+
+class MoveFolderRequest(BaseModel):
+    new_parent_path: str
+
+
+class RenameFolderRequest(BaseModel):
+    new_name: str
+
+
+@app.get("/folders")
+async def get_folders(
+    path: str = "/",
+    entity_id: str | None = None,
+    include_documents: bool = True,
+):
+    """Get folder tree starting from a path."""
+    from soml.mcp.tools.folder import get_folder_tree
+    try:
+        return get_folder_tree(path, entity_id, include_documents)
+    except Exception as e:
+        logger.error(f"Get folders error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/folders/contents")
+async def get_folder_contents_endpoint(
+    path: str = "/",
+    entity_id: str | None = None,
+):
+    """List documents and subfolders in a folder."""
+    from soml.mcp.tools.folder import list_folder_contents
+    try:
+        return list_folder_contents(path, entity_id)
+    except Exception as e:
+        logger.error(f"Get folder contents error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/folders")
+async def create_folder_endpoint(request: CreateFolderRequest):
+    """Create a new folder."""
+    from soml.mcp.tools.folder import create_folder
+    try:
+        result = create_folder(request.name, request.parent_path, request.entity_id)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to create folder"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create folder error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/folders/{folder_path:path}/move")
+async def move_folder_endpoint(folder_path: str, request: MoveFolderRequest):
+    """Move a folder to a new location."""
+    from soml.mcp.tools.folder import move_folder
+    try:
+        # Add leading slash if not present
+        folder_path = f"/{folder_path}" if not folder_path.startswith("/") else folder_path
+        result = move_folder(folder_path, request.new_parent_path)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to move folder"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Move folder error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/folders/{folder_path:path}/rename")
+async def rename_folder_endpoint(folder_path: str, request: RenameFolderRequest):
+    """Rename a folder."""
+    from soml.mcp.tools.folder import rename_folder
+    try:
+        folder_path = f"/{folder_path}" if not folder_path.startswith("/") else folder_path
+        result = rename_folder(folder_path, request.new_name)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to rename folder"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Rename folder error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/folders/{folder_path:path}")
+async def delete_folder_endpoint(folder_path: str, recursive: bool = False):
+    """Delete a folder."""
+    from soml.mcp.tools.folder import delete_folder
+    try:
+        folder_path = f"/{folder_path}" if not folder_path.startswith("/") else folder_path
+        result = delete_folder(folder_path, recursive)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to delete folder"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete folder error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/folders/{folder_path:path}/summary")
+async def get_folder_summary_endpoint(folder_path: str, entity_id: str | None = None):
+    """Get summary of folder contents for LLM context."""
+    from soml.mcp.tools.organization import get_folder_summary
+    try:
+        folder_path = f"/{folder_path}" if not folder_path.startswith("/") else folder_path
+        return get_folder_summary(folder_path, entity_id)
+    except Exception as e:
+        logger.error(f"Get folder summary error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# Tags
+# ==========================================
+
+class CreateTagRequest(BaseModel):
+    name: str
+    color: str | None = None
+    description: str | None = None
+
+
+class UpdateTagRequest(BaseModel):
+    color: str | None = None
+    description: str | None = None
+
+
+class AddTagsRequest(BaseModel):
+    tags: list[str]
+
+
+@app.get("/tags")
+async def get_tags():
+    """Get all tags with usage counts."""
+    from soml.mcp.tools.tag import get_all_tags
+    try:
+        return get_all_tags()
+    except Exception as e:
+        logger.error(f"Get tags error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tags")
+async def create_tag_endpoint(request: CreateTagRequest):
+    """Create a new tag."""
+    from soml.mcp.tools.tag import create_tag
+    try:
+        result = create_tag(request.name, request.color, request.description)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to create tag"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create tag error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/tags/{tag_name}")
+async def update_tag_endpoint(tag_name: str, request: UpdateTagRequest):
+    """Update tag metadata."""
+    from soml.mcp.tools.tag import update_tag
+    try:
+        result = update_tag(tag_name, request.color, request.description)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to update tag"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Update tag error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/tags/{tag_name}")
+async def delete_tag_endpoint(tag_name: str, force: bool = False):
+    """Delete a tag."""
+    from soml.mcp.tools.tag import delete_tag
+    try:
+        result = delete_tag(tag_name, force)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to delete tag"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete tag error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tags/{tag_name}/items")
+async def get_tag_items(
+    tag_name: str,
+    include_entities: bool = True,
+    include_documents: bool = True,
+):
+    """Find all items with a specific tag."""
+    from soml.mcp.tools.tag import find_by_tag
+    try:
+        return find_by_tag(tag_name, include_entities, include_documents)
+    except Exception as e:
+        logger.error(f"Find by tag error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/entities/{entity_id}/tags")
+async def add_entity_tags(entity_id: str, request: AddTagsRequest):
+    """Add tags to an entity."""
+    from soml.mcp.tools.tag import add_tags
+    try:
+        result = add_tags(entity_id, request.tags, item_type="entity")
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to add tags"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Add entity tags error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/entities/{entity_id}/tags")
+async def remove_entity_tags(entity_id: str, request: AddTagsRequest):
+    """Remove tags from an entity."""
+    from soml.mcp.tools.tag import remove_tags
+    try:
+        result = remove_tags(entity_id, request.tags, item_type="entity")
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to remove tags"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Remove entity tags error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/documents/{doc_id}/tags")
+async def add_document_tags(doc_id: str, request: AddTagsRequest):
+    """Add tags to a document."""
+    from soml.mcp.tools.tag import add_tags
+    try:
+        result = add_tags(doc_id, request.tags, item_type="document")
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to add tags"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Add document tags error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/documents/{doc_id}/tags")
+async def remove_document_tags(doc_id: str, request: AddTagsRequest):
+    """Remove tags from a document."""
+    from soml.mcp.tools.tag import remove_tags
+    try:
+        result = remove_tags(doc_id, request.tags, item_type="document")
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to remove tags"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Remove document tags error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/entities/{entity_id}/related")
+async def get_related_items_endpoint(entity_id: str, include_self: bool = False):
+    """Find items sharing tags with an entity."""
+    from soml.mcp.tools.tag import get_related_items
+    try:
+        return get_related_items(entity_id, include_self)
+    except Exception as e:
+        logger.error(f"Get related items error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# User Entity
+# ==========================================
+
+class UpdateUserRequest(BaseModel):
+    name: str | None = None
+    tags: list[str] | None = None
+
+
+class StoreUserNoteRequest(BaseModel):
+    title: str
+    content: str
+    folder_path: str | None = None
+    tags: list[str] | None = None
+
+
+@app.get("/user")
+async def get_user():
+    """Get the user entity (creates if not exists)."""
+    from soml.mcp.tools.user import get_or_create_user
+    try:
+        result = get_or_create_user()
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get user error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/user")
+async def update_user_endpoint(request: UpdateUserRequest):
+    """Update user entity information."""
+    from soml.mcp.tools.user import update_user
+    try:
+        result = update_user(request.name, request.tags)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to update user"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Update user error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user/documents")
+async def get_user_documents_endpoint(folder_path: str | None = None):
+    """Get documents owned by the user entity."""
+    from soml.mcp.tools.user import get_user_documents
+    try:
+        return get_user_documents(folder_path)
+    except Exception as e:
+        logger.error(f"Get user documents error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/user/notes")
+async def store_user_note_endpoint(request: StoreUserNoteRequest):
+    """Store a note under the user entity."""
+    from soml.mcp.tools.user import store_user_note
+    try:
+        result = store_user_note(request.title, request.content, request.folder_path, request.tags)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to store note"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Store user note error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# Organization Intelligence
+# ==========================================
+
+class SuggestLocationRequest(BaseModel):
+    content: str
+    title: str | None = None
+    entity_id: str | None = None
+
+
+@app.get("/organization/issues")
+async def get_organizational_issues(entity_id: str | None = None):
+    """Find organizational problems that should be addressed."""
+    from soml.mcp.tools.organization import find_organizational_issues
+    try:
+        return find_organizational_issues(entity_id)
+    except Exception as e:
+        logger.error(f"Get organizational issues error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/organization/suggest-location")
+async def suggest_location_endpoint(request: SuggestLocationRequest):
+    """Suggest folder and tags for document content."""
+    from soml.mcp.tools.organization import suggest_document_location
+    try:
+        return suggest_document_location(request.content, request.title, request.entity_id)
+    except Exception as e:
+        logger.error(f"Suggest location error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/organization/suggest-reorganization")
+async def suggest_reorganization_endpoint(folder_path: str, entity_id: str | None = None):
+    """Analyze folder and suggest improvements."""
+    from soml.mcp.tools.organization import suggest_reorganization
+    try:
+        return suggest_reorganization(folder_path, entity_id)
+    except Exception as e:
+        logger.error(f"Suggest reorganization error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# Activity & Audit Endpoints
+# ==========================================
+
+@app.get("/activity")
+async def get_activity(
+    limit: int = 50,
+    item_type: str | None = None,
+    actor: str | None = None,
+    since: str | None = None,
+):
+    """
+    Get recent activity across the entire system.
+    
+    Args:
+        limit: Max entries to return (default 50)
+        item_type: Filter by 'entity', 'document', or 'relationship'
+        actor: Filter by 'user', 'agent', or 'system'
+        since: ISO timestamp to filter from
+    """
+    try:
+        entries = audit.get_recent_activity(
+            limit=limit,
+            item_type=item_type,
+            actor=actor,
+            since=since,
+        )
+        return {"activity": entries, "count": len(entries)}
+    except Exception as e:
+        logger.error(f"Error fetching activity: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/activity/entity/{entity_id}")
+async def get_entity_activity(entity_id: str, limit: int = 50):
+    """
+    Get activity history for a specific entity and its documents.
+    """
+    try:
+        entries = audit.get_entity_activity(entity_id, limit=limit)
+        return {"activity": entries, "count": len(entries), "entity_id": entity_id}
+    except Exception as e:
+        logger.error(f"Error fetching entity activity: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/activity/item/{item_id}")
+async def get_item_activity(item_id: str, limit: int = 50):
+    """
+    Get activity history for a specific item (entity, document, or relationship).
+    """
+    try:
+        entries = audit.get_history(item_id, limit=limit)
+        can_undo = audit.can_undo(item_id)
+        return {
+            "activity": entries,
+            "count": len(entries),
+            "item_id": item_id,
+            "can_undo": can_undo,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching item activity: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/activity/undo/{item_id}")
+async def undo_last_action(item_id: str):
+    """
+    Undo the last action on an item.
+    
+    Supports:
+    - Undo document update: restores previous content
+    - Undo document delete (soft): restores from .deleted/ + re-indexes
+    - Undo entity update: restores previous metadata
+    - Undo entity delete (soft): restores markdown + re-indexes
+    - Undo relationship delete: re-creates the relationship
+    """
+    try:
+        if not audit.can_undo(item_id):
+            raise HTTPException(status_code=400, detail="No undoable action found for this item")
+        
+        history = audit.get_history(item_id, limit=1)
+        if not history:
+            raise HTTPException(status_code=404, detail="No history found")
+        
+        last_entry = history[0]
+        action = last_entry["action"]
+        old_data = last_entry.get("old_data", {})
+        item_type = last_entry.get("item_type", "unknown")
+        
+        if action == "update" and item_type == "document":
+            # Restore previous document content
+            old_content = old_data.get("content") if isinstance(old_data, dict) else None
+            old_title = old_data.get("title") if isinstance(old_data, dict) else None
+            
+            if old_content is not None:
+                success = md_store.update_document(
+                    doc_id=item_id,
+                    content=old_content,
+                    title=old_title,
+                    source=Source.USER,
+                )
+                if success:
+                    # Re-index
+                    md_doc = md_store.read_document(item_id)
+                    if md_doc:
+                        doc_reg = registry.get(item_id)
+                        registry.index(
+                            doc_id=item_id,
+                            path=md_doc["path"],
+                            entity_type=doc_reg.get("type", "document") if doc_reg else "document",
+                            name=old_title or (doc_reg.get("name") if doc_reg else "Document"),
+                            checksum=md_doc["checksum"],
+                            content=md_doc["content"],
+                        )
+                    
+                    # Log the undo itself
+                    audit.log(
+                        document_id=item_id,
+                        action="restore",
+                        old_data=last_entry.get("new_data"),
+                        new_data=old_data,
+                        actor="user",
+                        item_type=item_type,
+                        item_name=old_title,
+                    )
+                    
+                    return {"success": True, "message": "Document content restored", "action": "undo_update"}
+            
+            raise HTTPException(status_code=400, detail="No previous content to restore")
+        
+        elif action == "delete" and item_type == "document":
+            # Restore soft-deleted document
+            if isinstance(old_data, dict) and old_data.get("content"):
+                filepath = old_data.get("filepath")
+                reg_data = old_data.get("registry", {})
+                metadata = old_data.get("metadata", {})
+                
+                # Try to restore from .deleted/ folder
+                restored = False
+                if filepath:
+                    from pathlib import Path as PathObj
+                    deleted_dir = md_store.data_dir / ".deleted"
+                    if deleted_dir.exists():
+                        for f in deleted_dir.iterdir():
+                            if f.name.endswith(PathObj(filepath).name):
+                                restored_path = md_store.restore(f)
+                                if restored_path:
+                                    restored = True
+                                    # Re-index
+                                    registry.index(
+                                        doc_id=item_id,
+                                        path=restored_path,
+                                        entity_type=reg_data.get("type", "document"),
+                                        name=reg_data.get("name", "Document"),
+                                        checksum=md_store._compute_checksum(old_data["content"]),
+                                        content=old_data["content"],
+                                        document_type=reg_data.get("document_type"),
+                                        parent_entity_id=reg_data.get("parent_entity_id"),
+                                        parent_entity_type=reg_data.get("parent_entity_type"),
+                                    )
+                                    break
+                
+                if not restored:
+                    # Recreate from snapshot
+                    from uuid import UUID as UUIDType
+                    doc = Document(
+                        id=UUIDType(item_id),
+                        title=reg_data.get("name", "Restored Document"),
+                        document_type=DocumentType(reg_data.get("document_type", "note")),
+                        content=old_data["content"],
+                        parent_entity_id=UUIDType(reg_data["parent_entity_id"]) if reg_data.get("parent_entity_id") else None,
+                        parent_entity_type=EntityType(reg_data["parent_entity_type"]) if reg_data.get("parent_entity_type") else None,
+                        source=Source.USER,
+                    )
+                    filepath = md_store.write_document(doc)
+                    registry.index(
+                        doc_id=item_id,
+                        path=filepath,
+                        entity_type=EntityType.DOCUMENT,
+                        name=doc.title,
+                        checksum=md_store._compute_checksum(old_data["content"]),
+                        content=old_data["content"],
+                        document_type=reg_data.get("document_type"),
+                        parent_entity_id=reg_data.get("parent_entity_id"),
+                        parent_entity_type=reg_data.get("parent_entity_type"),
+                    )
+                
+                audit.log(
+                    document_id=item_id,
+                    action="restore",
+                    old_data=None,
+                    new_data=old_data,
+                    actor="user",
+                    item_type="document",
+                    item_name=reg_data.get("name", "Document"),
+                )
+                
+                return {"success": True, "message": "Document restored", "action": "undo_delete"}
+            
+            raise HTTPException(status_code=400, detail="No snapshot data to restore document from")
+        
+        elif action == "update" and item_type == "entity":
+            # Restore previous entity metadata
+            if isinstance(old_data, dict) and old_data.get("metadata"):
+                old_metadata = old_data["metadata"]
+                
+                # Read current entity
+                md_doc = md_store.read_by_id(item_id, registry.get(item_id, {}).get("type") if registry.get(item_id) else None)
+                if md_doc:
+                    metadata = md_doc.get("metadata", {})
+                    for key, value in old_metadata.items():
+                        metadata[key] = value
+                    metadata["updated_at"] = datetime.now().isoformat()
+                    
+                    import frontmatter
+                    content = md_doc.get("content", "")
+                    post = frontmatter.Post(content, **metadata)
+                    filepath = md_doc.get("path")
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        f.write(frontmatter.dumps(post))
+                    
+                    # Update graph
+                    graph_store.update_node(item_id, old_metadata)
+                    
+                    # Re-index
+                    entity = registry.get(item_id)
+                    if entity:
+                        registry.index(
+                            doc_id=item_id,
+                            path=str(filepath),
+                            entity_type=entity.get("type"),
+                            name=metadata.get("name") or metadata.get("title"),
+                            checksum=md_store._compute_checksum(frontmatter.dumps(post)),
+                            content=content,
+                        )
+                    
+                    audit.log(
+                        document_id=item_id,
+                        action="restore",
+                        old_data=last_entry.get("new_data"),
+                        new_data=old_data,
+                        actor="user",
+                        item_type="entity",
+                        item_name=metadata.get("name") or metadata.get("title"),
+                    )
+                    
+                    return {"success": True, "message": "Entity metadata restored", "action": "undo_update"}
+            
+            raise HTTPException(status_code=400, detail="No previous metadata to restore")
+        
+        elif action == "delete" and item_type == "relationship":
+            # Re-create the relationship from snapshot
+            if isinstance(old_data, dict) and old_data.get("properties"):
+                props = old_data["properties"]
+                source_id = old_data.get("source_id")
+                target_id = old_data.get("target_id")
+                
+                if source_id and target_id:
+                    rel_type = props.get("type", "related_to")
+                    from soml.mcp import tools as mcp_tools
+                    result = mcp_tools.add_relationship(
+                        source_id=source_id,
+                        target_id=target_id,
+                        rel_type=rel_type,
+                        properties=props,
+                        allow_multiple=True,
+                    )
+                    
+                    if result.action == "created":
+                        audit.log(
+                            document_id=result.relationship_id or item_id,
+                            action="restore",
+                            old_data=None,
+                            new_data=old_data,
+                            actor="user",
+                            item_type="relationship",
+                            item_name=f"Restored relationship ({rel_type})",
+                        )
+                        return {"success": True, "message": "Relationship restored", "action": "undo_delete", "relationship_id": result.relationship_id}
+            
+            raise HTTPException(status_code=400, detail="No snapshot data to restore relationship from")
+        
+        else:
+            raise HTTPException(status_code=400, detail=f"Undo not supported for action '{action}' on type '{item_type}'")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error undoing action for {item_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================

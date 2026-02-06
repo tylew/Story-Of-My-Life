@@ -234,6 +234,9 @@ class Person(BaseEntity):
     name: str
     """Person's name."""
     
+    is_self: bool = False
+    """Whether this person represents the user themselves."""
+    
     disambiguator: str | None = None
     """One-liner context for disambiguation, e.g., 'Cayden from Atitan board'."""
     

@@ -46,17 +46,21 @@ class AuditLog:
         old_data: dict[str, Any] | str | None = None,
         new_data: dict[str, Any] | str | None = None,
         actor: str = "agent",
+        item_type: str | None = None,
+        item_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """
         Log an audit entry.
         
         Args:
-            document_id: The document being changed
+            document_id: The item being changed (entity/doc/relationship ID)
             action: The type of change
             old_data: Previous state (for updates/deletes)
             new_data: New state (for creates/updates)
             actor: Who made the change (user, agent, system)
+            item_type: Type of item (entity, document, relationship)
+            item_name: Human-readable name of the item
             metadata: Additional context
         """
         # Serialize data
@@ -77,18 +81,23 @@ class AuditLog:
             action=action,
             old_data=old_str,
             new_data=new_str,
+            actor=actor,
+            item_type=item_type,
+            item_name=item_name,
         )
         
-        logger.debug(f"Logged {action} for document {document_id}")
+        logger.debug(f"Logged {action} for {item_type or 'item'} {document_id}")
     
     def log_create(
         self,
         document_id: str | UUID,
         data: dict[str, Any],
         actor: str = "agent",
+        item_type: str | None = None,
+        item_name: str | None = None,
     ) -> None:
-        """Log a document creation."""
-        self.log(document_id, "create", new_data=data, actor=actor)
+        """Log an item creation."""
+        self.log(document_id, "create", new_data=data, actor=actor, item_type=item_type, item_name=item_name)
     
     def log_update(
         self,
@@ -96,9 +105,11 @@ class AuditLog:
         old_data: dict[str, Any],
         new_data: dict[str, Any],
         actor: str = "agent",
+        item_type: str | None = None,
+        item_name: str | None = None,
     ) -> None:
-        """Log a document update."""
-        self.log(document_id, "update", old_data=old_data, new_data=new_data, actor=actor)
+        """Log an item update with before/after snapshots."""
+        self.log(document_id, "update", old_data=old_data, new_data=new_data, actor=actor, item_type=item_type, item_name=item_name)
     
     def log_delete(
         self,
@@ -106,14 +117,18 @@ class AuditLog:
         data: dict[str, Any],
         soft: bool = True,
         actor: str = "agent",
+        item_type: str | None = None,
+        item_name: str | None = None,
     ) -> None:
-        """Log a document deletion."""
+        """Log an item deletion."""
         action = "delete"
         self.log(
             document_id,
             action,
             old_data=data,
             actor=actor,
+            item_type=item_type,
+            item_name=item_name,
             metadata={"soft_delete": soft},
         )
     
@@ -124,6 +139,8 @@ class AuditLog:
         new_data: dict[str, Any],
         correction_note: str,
         actor: str = "user",
+        item_type: str | None = None,
+        item_name: str | None = None,
     ) -> None:
         """Log a correction (always user-initiated)."""
         self.log(
@@ -132,6 +149,8 @@ class AuditLog:
             old_data=old_data,
             new_data=new_data,
             actor=actor,
+            item_type=item_type,
+            item_name=item_name,
             metadata={"correction_note": correction_note},
         )
     
@@ -142,6 +161,7 @@ class AuditLog:
         source_data: dict[str, Any],
         merged_data: dict[str, Any],
         actor: str = "user",
+        item_name: str | None = None,
     ) -> None:
         """Log an entity merge (duplicate resolution)."""
         self.log(
@@ -150,6 +170,8 @@ class AuditLog:
             old_data=source_data,
             new_data={"merged_into": str(target_id), "merged_data": merged_data},
             actor=actor,
+            item_type="entity",
+            item_name=item_name,
         )
     
     def get_history(
@@ -203,10 +225,61 @@ class AuditLog:
         history = self.get_history(document_id, limit=1000)
         return [e for e in history if e["action"] == "correct"]
     
-    def get_recent_activity(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Get recent audit activity across all documents."""
-        # This would need a separate query method in RegistryStore
-        # For now, we'll return an empty list
-        # TODO: Implement cross-document audit query
-        return []
+    def get_recent_activity(
+        self,
+        limit: int = 50,
+        item_type: str | None = None,
+        actor: str | None = None,
+        since: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Get recent audit activity across all items.
+        
+        Args:
+            limit: Max entries to return
+            item_type: Filter by type (entity, document, relationship)
+            actor: Filter by actor (user, agent, system)
+            since: ISO timestamp to filter from
+        """
+        entries = self.registry.get_recent_activity(
+            limit=limit, item_type=item_type, actor=actor, since=since
+        )
+        
+        result = []
+        for entry in entries:
+            parsed = dict(entry)
+            if parsed.get("old_data"):
+                try:
+                    parsed["old_data"] = json.loads(parsed["old_data"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if parsed.get("new_data"):
+                try:
+                    parsed["new_data"] = json.loads(parsed["new_data"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            result.append(parsed)
+        
+        return result
+    
+    def get_entity_activity(self, entity_id: str | UUID, limit: int = 50) -> list[dict[str, Any]]:
+        """Get all activity related to an entity, including its documents."""
+        entries = self.registry.get_entity_activity(str(entity_id), limit=limit)
+        
+        result = []
+        for entry in entries:
+            parsed = dict(entry)
+            if parsed.get("old_data"):
+                try:
+                    parsed["old_data"] = json.loads(parsed["old_data"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if parsed.get("new_data"):
+                try:
+                    parsed["new_data"] = json.loads(parsed["new_data"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            result.append(parsed)
+        
+        return result
 

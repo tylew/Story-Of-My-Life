@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react'
 import { Users, Target, Zap, Calendar, TrendingUp, Clock, AlertCircle, RefreshCw } from 'lucide-react'
+import ActivityFeed from './ActivityFeed'
 
 const API_BASE = '/api'
 
-export default function Dashboard({ status, onEntitySelect, onRefresh, onNavigate }) {
-  const [recentActivity, setRecentActivity] = useState([])
+export default function Dashboard({ status, onEntitySelect, onDocumentSelect, onRefresh, onNavigate }) {
   const [openLoops, setOpenLoops] = useState([])
   const [loading, setLoading] = useState(true)
 
@@ -15,15 +15,8 @@ export default function Dashboard({ status, onEntitySelect, onRefresh, onNavigat
   const fetchData = async () => {
     setLoading(true)
     try {
-      const [timelineRes, loopsRes] = await Promise.all([
-        fetch(`${API_BASE}/timeline?days=7`),
-        fetch(`${API_BASE}/open-loops`)
-      ])
-      
-      const timelineData = await timelineRes.json()
+      const loopsRes = await fetch(`${API_BASE}/open-loops`)
       const loopsData = await loopsRes.json()
-      
-      setRecentActivity(timelineData.timeline?.slice(0, 5) || [])
       setOpenLoops(loopsData.loops?.slice(0, 3) || [])
     } catch (e) {
       console.error('Failed to fetch dashboard data:', e)
@@ -91,43 +84,14 @@ export default function Dashboard({ status, onEntitySelect, onRefresh, onNavigat
       </div>
 
       <div className="grid grid-cols-2 gap-6">
-        {/* Recent Activity */}
-        <div className="glass neon-border rounded-xl p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <Clock className="w-5 h-5 text-neon-blue" />
-            <h2 className="text-lg font-semibold">Recent Activity</h2>
-          </div>
-          
-          {loading ? (
-            <div className="flex items-center justify-center h-40">
-              <div className="animate-spin w-8 h-8 border-2 border-neon-purple border-t-transparent rounded-full" />
-            </div>
-          ) : recentActivity.length > 0 ? (
-            <div className="space-y-3">
-              {recentActivity.map((item, idx) => (
-                <button
-                  key={item.id || idx}
-                  onClick={() => onEntitySelect?.(item)}
-                  className="w-full flex items-center gap-4 p-3 rounded-lg bg-slate-dark/50 hover:bg-slate-dark transition-colors text-left"
-                >
-                  <div className={`
-                    w-10 h-10 rounded-lg flex items-center justify-center
-                    ${item.type === 'event' ? 'bg-neon-pink/20 text-neon-pink' : 'bg-neon-blue/20 text-neon-blue'}
-                  `}>
-                    {item.type === 'event' ? <Calendar className="w-5 h-5" /> : <Zap className="w-5 h-5" />}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate">{item.name}</p>
-                    <p className="text-xs text-slate-500 font-mono">
-                      {new Date(item.date).toLocaleDateString()}
-                    </p>
-                  </div>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <p className="text-slate-400 text-center py-8">No recent activity</p>
-          )}
+        {/* Recent Activity (Audit-based) */}
+        <div className="glass neon-border rounded-xl p-6 relative">
+          <ActivityFeed
+            limit={15}
+            compact={false}
+            onEntitySelect={onEntitySelect}
+            onDocumentSelect={onDocumentSelect}
+          />
         </div>
 
         {/* Open Loops */}

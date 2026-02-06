@@ -20,6 +20,7 @@ from soml.core.types import (
     Source,
 )
 from soml.mcp.resolution import EntityResolver
+from soml.storage.audit import AuditLog
 from soml.storage.graph import GraphStore
 from soml.storage.markdown import MarkdownStore
 from soml.storage.registry import RegistryStore
@@ -89,6 +90,7 @@ _registry: RegistryStore | None = None
 _md_store: MarkdownStore | None = None
 _graph_store: GraphStore | None = None
 _resolver: EntityResolver | None = None
+_audit: AuditLog | None = None
 
 
 def _get_registry() -> RegistryStore:
@@ -96,6 +98,13 @@ def _get_registry() -> RegistryStore:
     if _registry is None:
         _registry = RegistryStore()
     return _registry
+
+
+def _get_audit() -> AuditLog:
+    global _audit
+    if _audit is None:
+        _audit = AuditLog(_get_registry())
+    return _audit
 
 
 def _get_md_store() -> MarkdownStore:
@@ -233,6 +242,7 @@ __all__ = [
     "_get_md_store",
     "_get_graph_store",
     "_get_resolver",
+    "_get_audit",
     # Helpers
     "_create_general_info_document",
     "_append_to_general_info",

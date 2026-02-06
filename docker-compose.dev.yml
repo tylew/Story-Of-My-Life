@@ -98,6 +98,7 @@ services:
       - ./frontend/postcss.config.js:/app/postcss.config.js:cached
     environment:
       - VITE_API_URL=http://localhost:8000
+      - VITE_DEV_MODE=true
       - CHOKIDAR_USEPOLLING=true
     depends_on:
       - api

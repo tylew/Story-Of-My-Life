@@ -1,5 +1,22 @@
 import { useState, useEffect } from 'react'
-import { Users, Target, Zap, Calendar, FileText, RefreshCw, Filter, Grid, List, ChevronRight, Timer, AlertCircle } from 'lucide-react'
+import { Users, Target, Zap, Calendar, FileText, RefreshCw, Filter, Grid, List, ChevronRight, Timer, AlertCircle, Link2, Clock } from 'lucide-react'
+
+function timeAgo(dateStr) {
+  if (!dateStr) return null
+  const date = new Date(dateStr)
+  const now = new Date()
+  const seconds = Math.floor((now - date) / 1000)
+  if (seconds < 60) return 'just now'
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `${days}d ago`
+  const months = Math.floor(days / 30)
+  if (months < 12) return `${months}mo ago`
+  return `${Math.floor(months / 12)}y ago`
+}
 
 const API_BASE = '/api'
 
@@ -224,9 +241,20 @@ function EntityCard({ entity, config, colors, onClick, delay }) {
       )}
       
       <div className="flex items-center justify-between mt-3 pt-3 border-t border-slate-700/50">
-        <p className="text-xs text-slate-500 font-mono">
-          {entity.created_at ? new Date(entity.created_at).toLocaleDateString() : '-'}
-        </p>
+        <div className="flex items-center gap-3">
+          {entity.total_relationships > 0 && (
+            <span className="flex items-center gap-1 text-xs text-slate-500">
+              <Link2 className="w-3 h-3" />
+              {entity.total_relationships}
+            </span>
+          )}
+          {timeAgo(entity.updated_at) && (
+            <span className="flex items-center gap-1 text-xs text-slate-500">
+              <Clock className="w-3 h-3" />
+              {timeAgo(entity.updated_at)}
+            </span>
+          )}
+        </div>
         <ChevronRight className="w-4 h-4 text-slate-500" />
       </div>
     </button>
@@ -254,14 +282,23 @@ function EntityRow({ entity, config, colors, onClick, delay }) {
       </div>
       
       <div className="flex items-center gap-4 flex-shrink-0">
+        {entity.total_relationships > 0 && (
+          <span className="flex items-center gap-1 text-xs text-slate-500">
+            <Link2 className="w-3 h-3" />
+            {entity.total_relationships}
+          </span>
+        )}
         {entity.status && (
           <span className={`px-2 py-0.5 rounded-full text-xs ${colors.bg} ${colors.text}`}>
             {entity.status}
           </span>
         )}
-        <p className="text-xs text-slate-500 font-mono">
-          {entity.created_at ? new Date(entity.created_at).toLocaleDateString() : '-'}
-        </p>
+        {timeAgo(entity.updated_at) && (
+          <span className="flex items-center gap-1 text-xs text-slate-500 font-mono">
+            <Clock className="w-3 h-3" />
+            {timeAgo(entity.updated_at)}
+          </span>
+        )}
         <ChevronRight className="w-4 h-4 text-slate-500" />
       </div>
     </button>

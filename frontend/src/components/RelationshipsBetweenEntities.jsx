@@ -29,7 +29,9 @@ export default function RelationshipsBetweenEntities({
   targetEntity, 
   onClose, 
   onEntitySelect,
-  onRefresh 
+  onRefresh,
+  onDocumentSelect,
+  onViewAllDocuments,
 }) {
   const [relationships, setRelationships] = useState([])
   const [loading, setLoading] = useState(true)
@@ -201,6 +203,8 @@ export default function RelationshipsBetweenEntities({
               onSave={handleSaveRelationship}
               onDelete={handleDeleteRelationship}
               onEntitySelect={onEntitySelect}
+              onDocumentSelect={onDocumentSelect}
+              onViewAllDocuments={onViewAllDocuments}
             />
           </div>
         ) : (

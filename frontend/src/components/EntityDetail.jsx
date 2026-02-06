@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { X, Link2, Calendar, Tag, User, Target, Zap, FileText, Edit3, Trash2, Clock, ExternalLink, ChevronRight, Plus, Lock, File, Timer, AlertCircle, ArrowRight, ArrowLeft, ArrowLeftRight } from 'lucide-react'
 import EntityEditor from './EntityEditor'
 import RelationshipDetail from './RelationshipDetail'
+import DocumentMini, { DocumentMiniHeader } from './DocumentMini'
+import ActivityFeed from './ActivityFeed'
 
 const API_BASE = '/api'
 
@@ -23,7 +25,7 @@ const colorClasses = {
   orange: { bg: 'bg-amber-500/20', text: 'text-amber-500', border: 'border-amber-500/40' },
 }
 
-export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSelect, onRelationshipPairSelect }) {
+export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSelect, onRelationshipPairSelect, onViewAllDocuments }) {
   const [details, setDetails] = useState(null)
   const [documents, setDocuments] = useState([])
   const [loading, setLoading] = useState(true)
@@ -78,10 +80,35 @@ export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSel
     setLoadingDocs(false)
   }
 
+  const [relatedItems, setRelatedItems] = useState([])
+  const [loadingRelated, setLoadingRelated] = useState(false)
+
+  const fetchRelatedItems = async () => {
+    if (!entity?.id) return
+    setLoadingRelated(true)
+    try {
+      const res = await fetch(`${API_BASE}/entities/${entity.id}/related`)
+      if (res.ok) {
+        const data = await res.json()
+        setRelatedItems(Array.isArray(data) ? data : [])
+      }
+    } catch (e) {
+      console.error('Failed to fetch related items:', e)
+    }
+    setLoadingRelated(false)
+  }
+
+  useEffect(() => {
+    if (activeTab === 'related' && entity?.id && relatedItems.length === 0) {
+      fetchRelatedItems()
+    }
+  }, [activeTab, entity?.id])
+
   const tabs = [
     { id: 'overview', label: 'Overview' },
-    { id: 'documents', label: 'Documents', count: documents.length },
-    { id: 'relationships', label: 'Relationships' },
+    { id: 'documents', label: 'Docs', count: documents.length },
+    { id: 'relationships', label: 'Relations' },
+    { id: 'related', label: 'Related', count: relatedItems.length },
     { id: 'activity', label: 'Activity' },
   ]
 
@@ -189,6 +216,7 @@ export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSel
                 entityType={entity?.type}
                 onDocumentSelect={onDocumentSelect}
                 onRefresh={fetchDocuments}
+                onViewAllDocuments={onViewAllDocuments}
               />
             )}
             {activeTab === 'relationships' && (
@@ -210,8 +238,34 @@ export default function EntityDetail({ entity, onClose, onRefresh, onDocumentSel
                 onRelationshipPairSelect={onRelationshipPairSelect}
               />
             )}
-            {activeTab === 'activity' && (
-              <ActivityTab details={details} colors={colors} />
+            {activeTab === 'related' && (
+              <RelatedTab 
+                relatedItems={relatedItems}
+                loading={loadingRelated}
+                onEntitySelect={(e) => {
+                  onClose?.()
+                  setTimeout(() => {
+                    window.dispatchEvent(new CustomEvent('entity-select', { detail: e }))
+                  }, 50)
+                }}
+                onDocumentSelect={onDocumentSelect}
+              />
+            )}
+            {activeTab === 'activity' && entity?.id && (
+              <div className="p-4">
+                <ActivityFeed
+                  entityId={entity.id}
+                  limit={30}
+                  compact={false}
+                  onEntitySelect={(e) => {
+                    onClose?.()
+                    setTimeout(() => {
+                      window.dispatchEvent(new CustomEvent('entity-select', { detail: e }))
+                    }, 50)
+                  }}
+                  onDocumentSelect={onDocumentSelect}
+                />
+              </div>
             )}
           </>
         )}
@@ -612,111 +666,17 @@ function RelationshipsTab({ details, entity, onEntitySelect, onRefresh, onRelati
   )
 }
 
-function ActivityTab({ details }) {
-  // This would show audit history
+// ActivityTab is now replaced by the inline ActivityFeed component
+
+function DocumentsTab({ documents, loading, colors, entityId, entityType, onDocumentSelect, onRefresh, onViewAllDocuments }) {
   return (
-    <div className="p-4 text-center py-12">
-      <div className="w-16 h-16 rounded-xl bg-slate-dark flex items-center justify-center mx-auto mb-4">
-        <Clock className="w-8 h-8 text-slate-500" />
-      </div>
-      <p className="text-slate-400">Activity Timeline</p>
-      <p className="text-sm text-slate-500 mt-1">Changes and updates will appear here</p>
-    </div>
-  )
-}
-
-function DocumentsTab({ documents, loading, colors, entityId, entityType, onDocumentSelect, onRefresh }) {
-  const documentTypeLabels = {
-    general_info: 'General Info',
-    note: 'Note',
-    meeting: 'Meeting',
-    research: 'Research',
-    plan: 'Plan',
-    custom: 'Document',
-  }
-
-  const documentTypeColors = {
-    general_info: 'text-neon-cyan',
-    note: 'text-slate-400',
-    meeting: 'text-neon-pink',
-    research: 'text-neon-purple',
-    plan: 'text-neon-green',
-    custom: 'text-slate-300',
-  }
-
-  if (loading) {
-    return (
-      <div className="p-4 flex items-center justify-center py-12">
-        <div className="animate-spin w-6 h-6 border-2 border-neon-purple border-t-transparent rounded-full" />
-      </div>
-    )
-  }
-
-  // Filter out General Info docs - they're shown in the Overview tab
-  const otherDocs = documents.filter(d => d.document_type !== 'general_info')
-
-  return (
-    <div className="p-4 space-y-4">
-      {/* User & LLM Documents (excluding General Info which is in Overview) */}
-      <section>
-        <div className="flex items-center justify-between mb-2">
-          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Documents</h3>
-          <button
-            onClick={() => onDocumentSelect?.({ 
-              isNew: true, 
-              parent_entity_id: entityId,
-              parent_entity_type: entityType 
-            })}
-            className="flex items-center gap-1 text-xs text-neon-purple hover:text-neon-purple/80 transition-colors"
-          >
-            <Plus className="w-3 h-3" />
-            New
-          </button>
-        </div>
-
-        {otherDocs.length === 0 ? (
-          <div className="text-center py-8 glass neon-border rounded-lg">
-            <div className="w-12 h-12 rounded-xl bg-slate-dark flex items-center justify-center mx-auto mb-3">
-              <File className="w-6 h-6 text-slate-500" />
-            </div>
-            <p className="text-sm text-slate-400">No documents yet</p>
-            <button
-              onClick={() => onDocumentSelect?.({ 
-                isNew: true, 
-                parent_entity_id: entityId,
-                parent_entity_type: entityType 
-              })}
-              className="mt-3 text-sm text-neon-purple hover:underline"
-            >
-              Create first document
-            </button>
-          </div>
-        ) : (
-          <div className="space-y-2">
-            {otherDocs.map(doc => {
-              const docType = doc.document_type || 'custom'
-              const colorClass = documentTypeColors[docType] || documentTypeColors.custom
-              
-              return (
-                <button
-                  key={doc.id}
-                  onClick={() => onDocumentSelect?.(doc)}
-                  className="w-full glass neon-border rounded-lg p-3 text-left hover:border-neon-purple/60 transition-all flex items-center gap-3"
-                >
-                  <File className={`w-5 h-5 ${colorClass}`} />
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate text-sm">{doc.name || 'Untitled'}</p>
-                    <p className="text-xs text-slate-500">
-                      {documentTypeLabels[docType] || 'Document'}
-                    </p>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-slate-500" />
-                </button>
-              )
-            })}
-          </div>
-        )}
-      </section>
+    <div className="p-4">
+      <DocumentMini
+        entityId={entityId}
+        onDocumentSelect={onDocumentSelect}
+        onViewAll={(filters) => onViewAllDocuments?.(filters)}
+        maxItems={10}
+      />
     </div>
   )
 }
@@ -726,6 +686,122 @@ function MetadataRow({ label, value }) {
     <div className="flex items-center justify-between p-3">
       <span className="text-sm text-slate-400">{label}</span>
       <span className="text-sm text-slate-300 font-mono">{value}</span>
+    </div>
+  )
+}
+
+function RelatedTab({ relatedItems, loading, onEntitySelect, onDocumentSelect }) {
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-40">
+        <div className="animate-spin w-8 h-8 border-2 border-neon-purple border-t-transparent rounded-full" />
+      </div>
+    )
+  }
+
+  const entities = relatedItems.filter(item => item.item_type === 'entity')
+  const documents = relatedItems.filter(item => item.item_type === 'document')
+
+  if (relatedItems.length === 0) {
+    return (
+      <div className="p-4 text-center py-12">
+        <div className="w-16 h-16 rounded-xl bg-slate-dark flex items-center justify-center mx-auto mb-4">
+          <Tag className="w-8 h-8 text-slate-500" />
+        </div>
+        <p className="text-slate-400">No related items found</p>
+        <p className="text-sm text-slate-500 mt-1">Add tags to find connections</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="p-4 space-y-6">
+      {/* Related Entities */}
+      {entities.length > 0 && (
+        <section>
+          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+            Related Entities ({entities.length})
+          </h3>
+          <div className="space-y-2">
+            {entities.map(item => {
+              const itemConfig = typeConfig[item.type] || typeConfig.note
+              const ItemIcon = itemConfig.icon
+              const itemColors = colorClasses[itemConfig.color]
+              
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => onEntitySelect?.({ id: item.id, name: item.name, type: item.type })}
+                  className="w-full glass neon-border rounded-lg p-3 text-left hover:border-neon-purple/60 transition-all"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className={`w-8 h-8 rounded-lg ${itemColors.bg} flex items-center justify-center`}>
+                      <ItemIcon className={`w-4 h-4 ${itemColors.text}`} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium truncate text-sm">{item.name}</p>
+                      <p className="text-xs text-slate-500 capitalize">{item.type}</p>
+                    </div>
+                    {item.shared_tags?.length > 0 && (
+                      <div className="flex items-center gap-1">
+                        <Tag className="w-3 h-3 text-slate-400" />
+                        <span className="text-xs text-slate-400">
+                          {item.shared_tags.length} shared
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  {item.shared_tags?.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-2 pt-2 border-t border-slate-700/50">
+                      {item.shared_tags.slice(0, 5).map(tag => (
+                        <span key={tag} className="px-1.5 py-0.5 rounded text-[10px] bg-neon-purple/20 text-neon-purple">
+                          {tag}
+                        </span>
+                      ))}
+                      {item.shared_tags.length > 5 && (
+                        <span className="text-[10px] text-slate-500">+{item.shared_tags.length - 5} more</span>
+                      )}
+                    </div>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* Related Documents */}
+      {documents.length > 0 && (
+        <section>
+          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+            Related Documents ({documents.length})
+          </h3>
+          <div className="space-y-2">
+            {documents.map(item => (
+              <button
+                key={item.id}
+                onClick={() => onDocumentSelect?.({ id: item.id, name: item.name })}
+                className="w-full glass neon-border rounded-lg p-3 text-left hover:border-neon-purple/60 transition-all"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-lg bg-neon-blue/20 flex items-center justify-center">
+                    <FileText className="w-4 h-4 text-neon-blue" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium truncate text-sm">{item.name}</p>
+                    {item.shared_tags?.length > 0 && (
+                      <p className="text-xs text-slate-500">
+                        {item.shared_tags.length} shared tags
+                      </p>
+                    )}
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-slate-500" />
+                </div>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   )
 }

@@ -74,6 +74,50 @@ from soml.mcp.tools.document import (
     append_to_document,
     get_general_info,
     search_documents,
+    find_related_documents,
+    find_documents_needing_update,
+    create_document,
+    update_document,
+    move_document,
+    delete_document,
+)
+
+# Folder tools
+from soml.mcp.tools.folder import (
+    get_folder_tree,
+    list_folder_contents,
+    create_folder,
+    move_folder,
+    delete_folder,
+    rename_folder,
+)
+
+# Organization intelligence tools
+from soml.mcp.tools.organization import (
+    suggest_document_location,
+    get_folder_summary,
+    find_organizational_issues,
+    suggest_reorganization,
+)
+
+# Tag tools
+from soml.mcp.tools.tag import (
+    get_all_tags,
+    add_tags,
+    remove_tags,
+    find_by_tag,
+    get_related_items,
+    create_tag,
+    update_tag,
+    delete_tag,
+)
+
+# User tools
+from soml.mcp.tools.user import (
+    get_or_create_user,
+    get_user_documents,
+    store_user_note,
+    update_user,
 )
 
 # Embedding tools
@@ -141,6 +185,38 @@ __all__ = [
     "append_to_document",
     "get_general_info",
     "search_documents",
+    "find_related_documents",
+    "find_documents_needing_update",
+    "create_document",
+    "update_document",
+    "move_document",
+    "delete_document",
+    # Folder operations
+    "get_folder_tree",
+    "list_folder_contents",
+    "create_folder",
+    "move_folder",
+    "delete_folder",
+    "rename_folder",
+    # Organization intelligence
+    "suggest_document_location",
+    "get_folder_summary",
+    "find_organizational_issues",
+    "suggest_reorganization",
+    # Tag operations
+    "get_all_tags",
+    "add_tags",
+    "remove_tags",
+    "find_by_tag",
+    "get_related_items",
+    "create_tag",
+    "update_tag",
+    "delete_tag",
+    # User operations
+    "get_or_create_user",
+    "get_user_documents",
+    "store_user_note",
+    "update_user",
     # Embedding operations
     "generate_and_store_embedding",
     "generate_and_store_document_embedding",
@@ -156,4 +232,3 @@ __all__ = [
     # Batch operations
     "process_extraction",
 ]
-

@@ -245,19 +245,26 @@ def get_items_needing_review() -> list[dict]:
     return items
 
 
-def delete_entity(entity_id: str) -> dict:
+def delete_entity(entity_id: str, hard: bool = False) -> dict:
     """
     Delete an entity and its associated documents.
     
+    Soft delete by default: moves markdown to .deleted/ for recovery.
+    Full state captured in audit log for undo.
+    
     Args:
         entity_id: ID of the entity to delete
+        hard: If True, permanently delete. If False (default), soft delete.
     
     Returns:
         Result with success status
     """
+    from soml.mcp.tools.base import _get_audit
+    
     registry = _get_registry()
     md_store = _get_md_store()
     graph_store = _get_graph_store()
+    audit = _get_audit()
     
     # Get entity from registry
     entity = registry.get(str(entity_id))
@@ -265,26 +272,65 @@ def delete_entity(entity_id: str) -> dict:
         return {"success": False, "error": "Entity not found"}
     
     entity_type = entity.get("type")
+    entity_name = entity.get("name") or entity.get("title", "Unknown")
     
     try:
+        # Capture full snapshot for audit
+        md_doc = md_store.read_by_id(entity_id, entity_type)
+        entity_snapshot = {
+            "registry": entity,
+            "metadata": md_doc.get("metadata", {}) if md_doc else {},
+            "content": md_doc.get("content", "") if md_doc else "",
+            "filepath": str(md_doc.get("path", "")) if md_doc else "",
+        }
+        
         # Delete from graph
         graph_store.delete_node(entity_id)
         
-        # Delete documents
+        # Delete documents (with soft delete)
         docs = registry.list_entity_documents(entity_id)
+        doc_snapshots = []
         for doc in docs:
-            md_store.delete(doc["id"], "document")
+            doc_md = md_store.read_document(doc["id"])
+            doc_snapshots.append({
+                "registry": doc,
+                "content": doc_md.get("content", "") if doc_md else "",
+                "metadata": doc_md.get("metadata", {}) if doc_md else {},
+            })
+            
+            if doc_md and doc_md.get("path"):
+                from pathlib import Path
+                md_store.delete(Path(doc_md["path"]), soft=not hard)
+            
+            try:
+                graph_store.delete_document_node(doc["id"])
+            except Exception:
+                pass
+            
             registry.delete(doc["id"])
         
-        # Delete entity markdown
-        md_store.delete(entity_id, entity_type)
+        # Delete entity markdown (soft delete)
+        if md_doc and md_doc.get("path"):
+            from pathlib import Path
+            md_store.delete(Path(md_doc["path"]), soft=not hard)
         
         # Delete from registry
         registry.delete(entity_id)
         
+        # Audit log with full snapshot
+        entity_snapshot["documents"] = doc_snapshots
+        audit.log_delete(
+            document_id=entity_id,
+            data=entity_snapshot,
+            soft=not hard,
+            actor="agent",
+            item_type="entity",
+            item_name=entity_name,
+        )
+        
         logger.info(f"Deleted entity {entity_id} ({entity_type})")
         
-        return {"success": True, "entity_id": entity_id}
+        return {"success": True, "entity_id": entity_id, "soft_delete": not hard}
         
     except Exception as e:
         logger.error(f"Failed to delete entity {entity_id}: {e}")

@@ -11,6 +11,9 @@ import SearchModal from './components/SearchModal'
 import DocumentBrowser from './components/DocumentBrowser'
 import DocumentView from './components/DocumentView'
 import RelationshipsBetweenEntities from './components/RelationshipsBetweenEntities'
+import Settings from './components/Settings'
+import DeveloperSettings from './components/DeveloperSettings'
+import DevBanner, { isDevMode } from './components/DevBanner'
 import { Brain, Search, Bell } from 'lucide-react'
 
 const API_BASE = '/api'
@@ -20,17 +23,37 @@ function App() {
   const [selectedEntity, setSelectedEntity] = useState(null)
   const [selectedDocument, setSelectedDocument] = useState(null)
   const [selectedRelationshipPair, setSelectedRelationshipPair] = useState(null) // { sourceEntity, targetEntity }
+  const [documentBrowserFilters, setDocumentBrowserFilters] = useState({})
   const [status, setStatus] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [isSmallScreen, setIsSmallScreen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
   const [openLoopsCount, setOpenLoopsCount] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [graphFocusEntityId, setGraphFocusEntityId] = useState(null)
   const graphRef = useRef(null)
 
   useEffect(() => {
     fetchStatus()
     fetchOpenLoopsCount()
   }, [refreshKey])
+
+  // Responsive: detect small screen
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 1024px)')
+    const handler = (e) => setIsSmallScreen(e.matches)
+    setIsSmallScreen(mq.matches)
+    mq.addEventListener('change', handler)
+    return () => mq.removeEventListener('change', handler)
+  }, [])
+
+  // Auto-collapse left sidebar for immersive views or small screens
+  const fullWidthTabs = ['graph', 'documents']
+  useEffect(() => {
+    if (isSmallScreen || fullWidthTabs.includes(activeTab)) {
+      setSidebarOpen(false)
+    }
+  }, [activeTab, isSmallScreen])
 
   // Keyboard shortcut for search
   useEffect(() => {
@@ -46,18 +69,6 @@ function App() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [])
-
-  // Handle entity selection from EntityDetail relationships tab
-  useEffect(() => {
-    const handleEntitySelectEvent = (e) => {
-      if (e.detail) {
-        setSelectedEntity(e.detail)
-        setSelectedDocument(null)
-      }
-    }
-    window.addEventListener('entity-select', handleEntitySelectEvent)
-    return () => window.removeEventListener('entity-select', handleEntitySelectEvent)
   }, [])
 
   const fetchStatus = async () => {
@@ -80,40 +91,72 @@ function App() {
     }
   }
 
-  const handleEntitySelect = useCallback((entity) => {
+  // On small screens, opening a right panel should close the left sidebar
+  const hasRightPanel = !!(selectedEntity || selectedDocument || selectedRelationshipPair)
+
+  const handleEntitySelect = useCallback((entity, options = {}) => {
+    const { navigateToGraph = true } = options
+    
     setSelectedEntity(entity)
     setSelectedDocument(null)
     setSelectedRelationshipPair(null)
-    // Focus on entity in graph if we're on graph view
-    if (graphRef.current && entity?.id) {
-      graphRef.current.focusNode(entity.id)
+    
+    // Navigate to graph view and collapse nav sidebar
+    if (navigateToGraph && entity?.id) {
+      setActiveTab('graph')
+      setSidebarOpen(false) // Collapse navigation menu
+      setGraphFocusEntityId(entity.id) // Trigger ego-graph mode
+    } else if (isSmallScreen) {
+      setSidebarOpen(false) // On small screens, collapse left when right opens
     }
-  }, [])
+  }, [isSmallScreen])
+
+  // Handle entity selection from EntityDetail relationships tab
+  useEffect(() => {
+    const handleEntitySelectEvent = (e) => {
+      if (e.detail) {
+        handleEntitySelect(e.detail)
+      }
+    }
+    window.addEventListener('entity-select', handleEntitySelectEvent)
+    return () => window.removeEventListener('entity-select', handleEntitySelectEvent)
+  }, [handleEntitySelect])
 
   const handleDocumentSelect = useCallback((doc) => {
     setSelectedDocument(doc)
     setSelectedEntity(null)
     setSelectedRelationshipPair(null)
-  }, [])
+    if (isSmallScreen) setSidebarOpen(false)
+  }, [isSmallScreen])
 
   const handleRelationshipPairSelect = useCallback((sourceEntity, targetEntity) => {
     setSelectedRelationshipPair({ sourceEntity, targetEntity })
     setSelectedEntity(null)
     setSelectedDocument(null)
+    if (isSmallScreen) setSidebarOpen(false)
     // Focus on the link in graph
     if (graphRef.current && sourceEntity?.id && targetEntity?.id) {
       graphRef.current.focusLink(sourceEntity.id, targetEntity.id)
     }
-  }, [])
+  }, [isSmallScreen])
 
   const handleRefresh = useCallback(() => {
     setRefreshKey(k => k + 1)
   }, [])
 
+  const handleViewAllDocuments = useCallback((filters = {}) => {
+    setDocumentBrowserFilters(filters)
+    setActiveTab('documents')
+    // Close any open detail panels
+    setSelectedEntity(null)
+    setSelectedDocument(null)
+    setSelectedRelationshipPair(null)
+  }, [])
+
   const renderContent = () => {
     switch (activeTab) {
       case 'dashboard':
-        return <Dashboard status={status} onEntitySelect={handleEntitySelect} onRefresh={handleRefresh} onNavigate={setActiveTab} />
+        return <Dashboard status={status} onEntitySelect={handleEntitySelect} onDocumentSelect={handleDocumentSelect} onRefresh={handleRefresh} onNavigate={setActiveTab} />
       case 'graph':
         return (
           <GraphView 
@@ -126,6 +169,8 @@ function App() {
               sourceId: selectedRelationshipPair.sourceEntity?.id,
               targetId: selectedRelationshipPair.targetEntity?.id,
             } : null}
+            focusedEntityId={graphFocusEntityId}
+            onClearFocus={() => setGraphFocusEntityId(null)}
           />
         )
       case 'people':
@@ -143,16 +188,33 @@ function App() {
       case 'open-loops':
         return <OpenLoops onEntitySelect={handleEntitySelect} refreshKey={refreshKey} />
       case 'documents':
-        return <DocumentBrowser onDocumentSelect={handleDocumentSelect} onEntitySelect={handleEntitySelect} refreshKey={refreshKey} />
+        return (
+          <DocumentBrowser 
+            onDocumentSelect={handleDocumentSelect} 
+            onEntitySelect={handleEntitySelect}
+            onRelationshipSelect={(rel) => {
+              // When clicking a relationship from document browser, open the relationship pair view
+              // We'd need to fetch the full relationship details - for now just log
+              console.log('Relationship selected:', rel)
+            }}
+            refreshKey={refreshKey}
+            initialFilters={documentBrowserFilters}
+          />
+        )
       case 'assistant':
         return <ChatManager onEntityCreated={handleRefresh} onEntitySelect={handleEntitySelect} fullPage />
+      case 'settings':
+        return <Settings />
+      case 'dev-settings':
+        return isDevMode ? <DeveloperSettings onRefresh={handleRefresh} /> : <Dashboard status={status} onEntitySelect={handleEntitySelect} onDocumentSelect={handleDocumentSelect} onRefresh={handleRefresh} onNavigate={setActiveTab} />
       default:
-        return <Dashboard status={status} onEntitySelect={handleEntitySelect} onRefresh={handleRefresh} onNavigate={setActiveTab} />
+        return <Dashboard status={status} onEntitySelect={handleEntitySelect} onDocumentSelect={handleDocumentSelect} onRefresh={handleRefresh} onNavigate={setActiveTab} />
     }
   }
 
   return (
-    <div className="h-screen flex flex-col bg-midnight overflow-hidden">
+    <div className={`h-screen flex flex-col bg-midnight overflow-hidden ${isDevMode ? 'pb-7' : ''}`}>
+      <DevBanner />
       {/* Header */}
       <header className="h-16 border-b border-neon-purple/20 flex items-center justify-between px-6 glass flex-shrink-0">
         <div className="flex items-center gap-3">
@@ -161,7 +223,7 @@ function App() {
           </div>
           <div>
             <h1 className="text-xl font-display font-bold neon-text">Story of My Life</h1>
-            <p className="text-xs text-slate-400 font-mono">Personal Knowledge Graph</p>
+            <p className="text-xs text-slate-400 font-mono">Knowledge Assistant</p>
           </div>
         </div>
         
@@ -188,72 +250,90 @@ function App() {
             </button>
           )}
 
-          {/* Status indicators */}
-          {status && (
-            <div className="flex items-center gap-4 text-sm">
-              <StatBadge label="People" count={status.counts?.person || 0} color="cyan" />
-              <StatBadge label="Projects" count={status.counts?.project || 0} color="purple" />
-              <StatBadge label="Goals" count={status.counts?.goal || 0} color="green" />
-              <StatBadge label="Events" count={status.counts?.event || 0} color="pink" />
-              <StatBadge label="Periods" count={status.counts?.period || 0} color="orange" />
-            </div>
-          )}
-
-          {/* Connection Status */}
-          <div className="h-8 w-px bg-slate-700" />
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-neon-green animate-pulse" />
-            <span className="text-xs text-slate-400 font-mono">Connected</span>
-          </div>
         </div>
       </header>
 
-      <div className="flex-1 flex overflow-hidden">
-        {/* Sidebar */}
+      <div className="flex-1 flex overflow-hidden relative">
         <Sidebar 
           activeTab={activeTab} 
-          setActiveTab={setActiveTab}
+          setActiveTab={(tab) => {
+            setActiveTab(tab)
+            if (isSmallScreen) {
+              setSelectedEntity(null)
+              setSelectedDocument(null)
+              setSelectedRelationshipPair(null)
+            }
+          }}
           sidebarOpen={sidebarOpen}
-          setSidebarOpen={setSidebarOpen}
+          setSidebarOpen={(open) => {
+            setSidebarOpen(open)
+            if (isSmallScreen && open) {
+              setSelectedEntity(null)
+              setSelectedDocument(null)
+              setSelectedRelationshipPair(null)
+            }
+          }}
           openLoopsCount={openLoopsCount}
+          status={status}
         />
 
         {/* Main Content */}
-        <main className="flex-1 flex overflow-hidden">
+        <main className="flex-1 flex overflow-hidden relative">
           {/* Content Area */}
           <div className="flex-1 relative overflow-hidden">
             {renderContent()}
           </div>
 
+          {/* Right panel backdrop — overlay on small screens */}
+          {hasRightPanel && isSmallScreen && (
+            <div 
+              className="absolute inset-0 bg-black/40 z-30"
+              onClick={() => {
+                setSelectedEntity(null)
+                setSelectedDocument(null)
+                setSelectedRelationshipPair(null)
+              }}
+            />
+          )}
+
           {/* Entity Detail Panel */}
           {selectedEntity && (
-            <EntityDetail 
-              entity={selectedEntity} 
-              onClose={() => setSelectedEntity(null)}
-              onRefresh={handleRefresh}
-              onDocumentSelect={handleDocumentSelect}
-              onRelationshipPairSelect={handleRelationshipPairSelect}
-            />
+            <div className={isSmallScreen ? 'absolute right-0 top-0 bottom-0 z-40 max-w-[90vw]' : ''}>
+              <EntityDetail 
+                entity={selectedEntity} 
+                onClose={() => setSelectedEntity(null)}
+                onRefresh={handleRefresh}
+                onDocumentSelect={handleDocumentSelect}
+                onRelationshipPairSelect={handleRelationshipPairSelect}
+                onViewAllDocuments={handleViewAllDocuments}
+              />
+            </div>
           )}
 
           {/* Document View Panel */}
           {selectedDocument && (
-            <DocumentView
-              document={selectedDocument}
-              onClose={() => setSelectedDocument(null)}
-              onRefresh={handleRefresh}
-            />
+            <div className={isSmallScreen ? 'absolute right-0 top-0 bottom-0 z-40 max-w-[90vw]' : ''}>
+              <DocumentView
+                document={selectedDocument}
+                onClose={() => setSelectedDocument(null)}
+                onRefresh={handleRefresh}
+              />
+            </div>
           )}
 
           {/* Relationships Between Entities Panel */}
           {selectedRelationshipPair && (
-            <RelationshipsBetweenEntities
-              sourceEntity={selectedRelationshipPair.sourceEntity}
-              targetEntity={selectedRelationshipPair.targetEntity}
-              onClose={() => setSelectedRelationshipPair(null)}
-              onEntitySelect={handleEntitySelect}
-              onRefresh={handleRefresh}
-            />
+            <div className={isSmallScreen ? 'absolute right-0 top-0 bottom-0 z-40 max-w-[90vw]' : ''}>
+              <RelationshipsBetweenEntities
+                sourceEntity={selectedRelationshipPair.sourceEntity}
+                targetEntity={selectedRelationshipPair.targetEntity}
+                onClose={() => setSelectedRelationshipPair(null)}
+                onEntitySelect={handleEntitySelect}
+                onRefresh={handleRefresh}
+                onDocumentSelect={handleDocumentSelect}
+                onViewAllDocuments={handleViewAllDocuments}
+              />
+            </div>
           )}
         </main>
       </div>
@@ -265,24 +345,6 @@ function App() {
         onSelect={handleEntitySelect}
       />
     </div>
-  )
-}
-
-function StatBadge({ label, count, color }) {
-  const colorClasses = {
-    cyan: 'text-neon-cyan',
-    purple: 'text-neon-purple',
-    green: 'text-neon-green',
-    pink: 'text-neon-pink',
-    blue: 'text-neon-blue',
-    orange: 'text-amber-500',
-  }
-  
-  return (
-    <span className={`flex items-center gap-1 ${colorClasses[color]}`}>
-      <span className="font-mono font-bold">{count}</span>
-      <span className="text-xs opacity-70">{label}</span>
-    </span>
   )
 }
 

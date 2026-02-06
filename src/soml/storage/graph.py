@@ -641,4 +641,483 @@ class GraphStore:
         
         logger.info(f"Rebuilt graph with {count} nodes")
         return count
+    
+    # =========================================================================
+    # Document Node Operations
+    # =========================================================================
+    
+    def upsert_document_node(
+        self,
+        doc_id: str,
+        title: str,
+        doc_type: str,
+        parent_entity_id: str | None = None,
+        parent_relationship_id: str | None = None,
+        embedding: list[float] | None = None,
+    ) -> None:
+        """
+        Create or update a Document node in the graph.
+        
+        Documents are first-class nodes for semantic traversal, connected to:
+        - Parent entity via :BELONGS_TO
+        - Parent relationship via :BELONGS_TO (to relationship node)
+        - Tags via :HAS_TAG
+        - Referenced entities via :REFERENCES
+        """
+        props = {
+            "id": doc_id,
+            "title": title,
+            "doc_type": doc_type,
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+        }
+        
+        with self.session() as session:
+            # Create/update document node
+            if embedding:
+                props["embedding"] = embedding
+            
+            session.run(
+                """
+                MERGE (d:Document {id: $id})
+                SET d += $props
+                """,
+                id=doc_id,
+                props=props,
+            )
+            
+            # Create :BELONGS_TO relationship to parent entity if provided
+            if parent_entity_id:
+                session.run(
+                    """
+                    MATCH (d:Document {id: $doc_id})
+                    MATCH (e:Entity {id: $entity_id})
+                    MERGE (d)-[:BELONGS_TO]->(e)
+                    """,
+                    doc_id=doc_id,
+                    entity_id=parent_entity_id,
+                )
+            
+            # Store parent_relationship_id as a property on the document node
+            # (Neo4j relationships are edges, not nodes, so we store as property)
+            if parent_relationship_id:
+                session.run(
+                    """
+                    MATCH (d:Document {id: $doc_id})
+                    SET d.parent_relationship_id = $rel_id
+                    """,
+                    doc_id=doc_id,
+                    rel_id=parent_relationship_id,
+                )
+            
+            logger.debug(f"Upserted document node {doc_id}: {title}")
+    
+    def delete_document_node(self, doc_id: str) -> bool:
+        """Delete a Document node and all its relationships."""
+        with self.session() as session:
+            result = session.run(
+                "MATCH (d:Document {id: $id}) DETACH DELETE d RETURN count(d) as deleted",
+                id=doc_id,
+            )
+            record = result.single()
+            deleted = record["deleted"] > 0 if record else False
+            
+            if deleted:
+                logger.debug(f"Deleted document node {doc_id}")
+            
+            return deleted
+    
+    def sync_document_references(self, doc_id: str, referenced_entity_ids: list[str]) -> None:
+        """
+        Sync :REFERENCES edges from a document to entities.
+        
+        Called after parsing wikilinks from document content.
+        Removes old references and creates new ones.
+        """
+        with self.session() as session:
+            # Remove existing references
+            session.run(
+                """
+                MATCH (d:Document {id: $doc_id})-[r:REFERENCES]->()
+                DELETE r
+                """,
+                doc_id=doc_id,
+            )
+            
+            # Create new references
+            for entity_id in referenced_entity_ids:
+                session.run(
+                    """
+                    MATCH (d:Document {id: $doc_id})
+                    MATCH (e:Entity {id: $entity_id})
+                    MERGE (d)-[:REFERENCES]->(e)
+                    """,
+                    doc_id=doc_id,
+                    entity_id=entity_id,
+                )
+            
+            logger.debug(f"Synced {len(referenced_entity_ids)} references for document {doc_id}")
+    
+    def store_document_embedding(self, doc_id: str, embedding: list[float]) -> None:
+        """Store a vector embedding for a document."""
+        with self.session() as session:
+            session.run(
+                """
+                MATCH (d:Document {id: $id})
+                SET d.embedding = $embedding
+                """,
+                id=doc_id,
+                embedding=embedding,
+            )
+            logger.debug(f"Stored embedding for document {doc_id}")
+    
+    # =========================================================================
+    # Tag Node Operations
+    # =========================================================================
+    
+    def ensure_tag_node(self, tag_name: str, color: str | None = None) -> None:
+        """
+        Ensure a Tag node exists in the graph.
+        
+        Tags are shared across entities and documents.
+        """
+        props = {
+            "name": tag_name,
+            "created_at": datetime.now().isoformat(),
+        }
+        if color:
+            props["color"] = color
+        
+        with self.session() as session:
+            session.run(
+                """
+                MERGE (t:Tag {name: $name})
+                ON CREATE SET t += $props
+                """,
+                name=tag_name,
+                props=props,
+            )
+            logger.debug(f"Ensured tag node: {tag_name}")
+    
+    def sync_item_tags(
+        self,
+        item_id: str,
+        item_type: str,  # "entity" or "document"
+        tags: list[str],
+    ) -> None:
+        """
+        Sync :HAS_TAG edges for an entity or document.
+        
+        Removes old tags and creates new ones.
+        """
+        label = "Entity" if item_type == "entity" else "Document"
+        
+        with self.session() as session:
+            # Remove existing tag relationships
+            session.run(
+                f"""
+                MATCH (n:{label} {{id: $item_id}})-[r:HAS_TAG]->()
+                DELETE r
+                """,
+                item_id=item_id,
+            )
+            
+            # Create new tag relationships
+            for tag_name in tags:
+                # Ensure tag exists
+                self.ensure_tag_node(tag_name)
+                
+                # Create relationship
+                session.run(
+                    f"""
+                    MATCH (n:{label} {{id: $item_id}})
+                    MATCH (t:Tag {{name: $tag_name}})
+                    MERGE (n)-[:HAS_TAG]->(t)
+                    """,
+                    item_id=item_id,
+                    tag_name=tag_name,
+                )
+            
+            logger.debug(f"Synced {len(tags)} tags for {item_type} {item_id}")
+    
+    def add_item_tags(
+        self,
+        item_id: str,
+        item_type: str,  # "entity" or "document"
+        tags: list[str],
+    ) -> None:
+        """Add tags to an entity or document without removing existing ones."""
+        label = "Entity" if item_type == "entity" else "Document"
+        
+        with self.session() as session:
+            for tag_name in tags:
+                self.ensure_tag_node(tag_name)
+                session.run(
+                    f"""
+                    MATCH (n:{label} {{id: $item_id}})
+                    MATCH (t:Tag {{name: $tag_name}})
+                    MERGE (n)-[:HAS_TAG]->(t)
+                    """,
+                    item_id=item_id,
+                    tag_name=tag_name,
+                )
+    
+    def remove_item_tags(
+        self,
+        item_id: str,
+        item_type: str,  # "entity" or "document"
+        tags: list[str],
+    ) -> None:
+        """Remove specific tags from an entity or document."""
+        label = "Entity" if item_type == "entity" else "Document"
+        
+        with self.session() as session:
+            for tag_name in tags:
+                session.run(
+                    f"""
+                    MATCH (n:{label} {{id: $item_id}})-[r:HAS_TAG]->(t:Tag {{name: $tag_name}})
+                    DELETE r
+                    """,
+                    item_id=item_id,
+                    tag_name=tag_name,
+                )
+    
+    def delete_orphan_tags(self) -> int:
+        """
+        Delete Tag nodes that have no incoming :HAS_TAG edges.
+        
+        Returns count of deleted tags.
+        """
+        with self.session() as session:
+            result = session.run(
+                """
+                MATCH (t:Tag)
+                WHERE NOT ()-[:HAS_TAG]->(t)
+                DELETE t
+                RETURN count(t) as deleted
+                """
+            )
+            record = result.single()
+            deleted = record["deleted"] if record else 0
+            
+            if deleted > 0:
+                logger.info(f"Deleted {deleted} orphan tags")
+            
+            return deleted
+    
+    # =========================================================================
+    # Graph Traversal Queries
+    # =========================================================================
+    
+    def find_by_tag(
+        self,
+        tag_name: str,
+        include_entities: bool = True,
+        include_documents: bool = True,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """
+        Find all entities and/or documents with a specific tag.
+        """
+        results = []
+        
+        with self.session() as session:
+            if include_entities:
+                entity_result = session.run(
+                    """
+                    MATCH (e:Entity)-[:HAS_TAG]->(t:Tag {name: $tag_name})
+                    RETURN e, 'entity' as item_type
+                    LIMIT $limit
+                    """,
+                    tag_name=tag_name,
+                    limit=limit,
+                )
+                for record in entity_result:
+                    results.append({
+                        "item": dict(record["e"]),
+                        "item_type": "entity",
+                    })
+            
+            if include_documents:
+                remaining = limit - len(results)
+                if remaining > 0:
+                    doc_result = session.run(
+                        """
+                        MATCH (d:Document)-[:HAS_TAG]->(t:Tag {name: $tag_name})
+                        RETURN d, 'document' as item_type
+                        LIMIT $limit
+                        """,
+                        tag_name=tag_name,
+                        limit=remaining,
+                    )
+                    for record in doc_result:
+                        results.append({
+                            "item": dict(record["d"]),
+                            "item_type": "document",
+                        })
+        
+        return results
+    
+    def find_related_by_tags(
+        self,
+        entity_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """
+        Find entities and documents that share tags with a given entity.
+        """
+        with self.session() as session:
+            result = session.run(
+                """
+                MATCH (source:Entity {id: $entity_id})-[:HAS_TAG]->(t:Tag)<-[:HAS_TAG]-(related)
+                WHERE related.id <> $entity_id
+                WITH related, collect(DISTINCT t.name) as shared_tags, count(t) as tag_count
+                RETURN related, shared_tags, tag_count,
+                       CASE WHEN 'Document' IN labels(related) THEN 'document' ELSE 'entity' END as item_type
+                ORDER BY tag_count DESC
+                LIMIT $limit
+                """,
+                entity_id=entity_id,
+                limit=limit,
+            )
+            
+            return [
+                {
+                    "item": dict(record["related"]),
+                    "item_type": record["item_type"],
+                    "shared_tags": record["shared_tags"],
+                    "tag_count": record["tag_count"],
+                }
+                for record in result
+            ]
+    
+    def find_documents_referencing(self, entity_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """
+        Find all documents that reference a specific entity via wikilinks.
+        """
+        with self.session() as session:
+            result = session.run(
+                """
+                MATCH (d:Document)-[:REFERENCES]->(e:Entity {id: $entity_id})
+                RETURN d
+                LIMIT $limit
+                """,
+                entity_id=entity_id,
+                limit=limit,
+            )
+            
+            return [dict(record["d"]) for record in result]
+    
+    def find_documents_for_entity(self, entity_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """
+        Find all documents that belong to an entity.
+        """
+        with self.session() as session:
+            result = session.run(
+                """
+                MATCH (d:Document)-[:BELONGS_TO]->(e:Entity {id: $entity_id})
+                RETURN d
+                ORDER BY d.updated_at DESC
+                LIMIT $limit
+                """,
+                entity_id=entity_id,
+                limit=limit,
+            )
+            
+            return [dict(record["d"]) for record in result]
+    
+    def find_documents_for_relationship(self, relationship_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """
+        Find all documents that belong to a relationship.
+        """
+        with self.session() as session:
+            result = session.run(
+                """
+                MATCH (d:Document)
+                WHERE d.parent_relationship_id = $relationship_id
+                RETURN d
+                ORDER BY d.updated_at DESC
+                LIMIT $limit
+                """,
+                relationship_id=relationship_id,
+                limit=limit,
+            )
+            
+            return [dict(record["d"]) for record in result]
+    
+    def get_item_tags(self, item_id: str, item_type: str = "entity") -> list[str]:
+        """Get all tags for an entity or document."""
+        label = "Entity" if item_type == "entity" else "Document"
+        
+        with self.session() as session:
+            result = session.run(
+                f"""
+                MATCH (n:{label} {{id: $item_id}})-[:HAS_TAG]->(t:Tag)
+                RETURN t.name as tag_name
+                """,
+                item_id=item_id,
+            )
+            
+            return [record["tag_name"] for record in result]
+    
+    def document_vector_search(
+        self,
+        embedding: list[float],
+        limit: int = 10,
+        parent_entity_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Perform vector similarity search on documents.
+        
+        Returns documents ordered by cosine similarity.
+        """
+        with self.session() as session:
+            if parent_entity_id:
+                query = """
+                    MATCH (d:Document)-[:BELONGS_TO]->(e:Entity {id: $entity_id})
+                    WHERE d.embedding IS NOT NULL
+                    WITH d, gds.similarity.cosine(d.embedding, $embedding) as score
+                    RETURN d, score
+                    ORDER BY score DESC
+                    LIMIT $limit
+                """
+                params = {"embedding": embedding, "limit": limit, "entity_id": parent_entity_id}
+            else:
+                # Use vector index if available
+                try:
+                    result = session.run(
+                        """
+                        CALL db.index.vector.queryNodes('document_embeddings', $limit, $embedding)
+                        YIELD node, score
+                        RETURN node as d, score
+                        ORDER BY score DESC
+                        """,
+                        limit=limit,
+                        embedding=embedding,
+                    )
+                    return [
+                        {"document": dict(record["d"]), "score": record["score"]}
+                        for record in result
+                    ]
+                except Exception:
+                    # Fall back to brute force if index doesn't exist
+                    query = """
+                        MATCH (d:Document)
+                        WHERE d.embedding IS NOT NULL
+                        WITH d, gds.similarity.cosine(d.embedding, $embedding) as score
+                        RETURN d, score
+                        ORDER BY score DESC
+                        LIMIT $limit
+                    """
+                    params = {"embedding": embedding, "limit": limit}
+            
+            try:
+                result = session.run(query, **params)
+                return [
+                    {"document": dict(record["d"]), "score": record["score"]}
+                    for record in result
+                ]
+            except Exception as e:
+                logger.error(f"Document vector search failed: {e}")
+                return []
 

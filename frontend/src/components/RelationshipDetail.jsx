@@ -2,8 +2,9 @@ import { useState, useEffect } from 'react'
 import { 
   X, Link2, Edit3, Save, Trash2, ArrowRight, ArrowLeft, ArrowLeftRight,
   Calendar, FileText, Tag, Clock, ChevronDown, ChevronUp,
-  ExternalLink, Users, Target, Zap, Timer
+  ExternalLink, Users, Target, Zap, Timer, File
 } from 'lucide-react'
+import DocumentMini, { DocumentMiniHeader } from './DocumentMini'
 
 const API_BASE = '/api'
 
@@ -37,7 +38,9 @@ export default function RelationshipDetail({
   onClose, 
   onSave, 
   onDelete,
-  onEntitySelect 
+  onEntitySelect,
+  onDocumentSelect,
+  onViewAllDocuments,
 }) {
   const [isEditing, setIsEditing] = useState(false)
   const [editData, setEditData] = useState({
@@ -397,6 +400,22 @@ export default function RelationshipDetail({
                 </div>
               )}
             </div>
+
+            {/* Documents Section */}
+            {relationship?.id && (
+              <div className="pt-3 border-t border-slate-700/50">
+                <DocumentMiniHeader 
+                  title="Documents"
+                  onViewAll={() => onViewAllDocuments?.({ relationshipId: relationship.id })}
+                />
+                <DocumentMini
+                  relationshipId={relationship.id}
+                  onDocumentSelect={onDocumentSelect}
+                  onViewAll={(filters) => onViewAllDocuments?.(filters)}
+                  maxItems={3}
+                />
+              </div>
+            )}
           </>
         )}
       </div>
